@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -46,7 +45,8 @@ func setupAPIForTestWithCallback(cb func(*conf.GlobalConfiguration, *storage.Con
 		cb(nil, conn)
 	}
 
-	return NewAPIWithVersion(context.Background(), config, conn, apiTestVersion), config, nil
+	limiterOpts := NewLimiterOptions(config)
+	return NewAPIWithVersion(config, conn, apiTestVersion, limiterOpts), config, nil
 }
 
 func TestEmailEnabledByDefault(t *testing.T) {

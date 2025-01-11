@@ -1,6 +1,6 @@
 # Auth - Authentication and User Management by Supabase
 
-[![Coverage Status](https://coveralls.io/repos/github/supabase/auth/badge.svg?branch=master)](https://coveralls.io/github/supabase/gotrue?branch=master)
+[![Coverage Status](https://coveralls.io/repos/github/supabase/auth/badge.svg?branch=master)](https://coveralls.io/github/supabase/auth?branch=master)
 
 Auth is a user management and authentication server written in Go that powers
 [Supabase](https://supabase.com)'s features such as:
@@ -12,7 +12,7 @@ Auth is a user management and authentication server written in Go that powers
 - Sign in with external providers (Google, Apple, Facebook, Discord, ...)
 
 It is originally based on the excellent
-[Auth codebase by Netlify](https://github.com/netlify/auth), however both have diverged significantly in features and capabilities.
+[GoTrue codebase by Netlify](https://github.com/netlify/gotrue), however both have diverged significantly in features and capabilities.
 
 If you wish to contribute to the project, please refer to the [contributing guide](/CONTRIBUTING.md).
 
@@ -30,12 +30,12 @@ Create a `.env` file to store your own custom env vars. See [`example.env`](exam
 1. Start the local postgres database in a postgres container: `docker-compose -f docker-compose-dev.yml up postgres`
 2. Build the auth binary: `make build` . You should see an output like this:
 
-```
+```bash
 go build -ldflags "-X github.com/supabase/auth/cmd.Version=`git rev-parse HEAD`"
 GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/supabase/auth/cmd.Version=`git rev-parse HEAD`" -o gotrue-arm64
 ```
 
-3. Execute the auth binary: `./gotrue`
+3. Execute the auth binary: `./auth`
 
 ### If you have docker installed
 
@@ -143,13 +143,9 @@ comprehensive list of those features:
    configuration parameter.
 2. System user (zero UUID user).
 3. Super admin via the `is_super_admin` column.
-4. SAML sign-in provider via the `GOTRUE_SAML_ENABLED` configuration
-   parameter. (A different implementation for SAML may appear in the future
-   which will be supported.)
-5. Support for MySQL based databases. (Only Postgres is supported.)
-6. Group information in JWTs via `GOTRUE_JWT_ADMIN_GROUP_NAME` and other
+4. Group information in JWTs via `GOTRUE_JWT_ADMIN_GROUP_NAME` and other
    configuration fields.
-7. Symmetrics JWTs. In the future it is very likely that Auth will begin
+5. Symmetrics JWTs. In the future it is very likely that Auth will begin
    issuing asymmetric JWTs (subject to configuration), so do not rely on the
    assumption that only HS256 signed JWTs will be issued long term.
 
@@ -664,27 +660,6 @@ Default Content (if template is unavailable):
 <p><a href="{{ .ConfirmationURL }}">Change Email</a></p>
 ```
 
-`WEBHOOK_URL` - `string`
-
-Url of the webhook receiver endpoint. This will be called when events like `validate`, `signup` or `login` occur.
-
-`WEBHOOK_SECRET` - `string`
-
-Shared secret to authorize webhook requests. This secret signs the [JSON Web Signature](https://tools.ietf.org/html/draft-ietf-jose-json-web-signature-41) of the request. You _should_ use this to verify the integrity of the request. Otherwise others can feed your webhook receiver with fake data.
-
-`WEBHOOK_RETRIES` - `number`
-
-How often Auth should try a failed hook.
-
-`WEBHOOK_TIMEOUT_SEC` - `number`
-
-Time between retries (in seconds).
-
-`WEBHOOK_EVENTS` - `list`
-
-Which events should trigger a webhook. You can provide a comma separated list.
-For example to listen to all events, provide the values `validate,signup,login`.
-
 ### Phone Auth
 
 `SMS_AUTOCONFIRM` - `bool`
@@ -740,6 +715,12 @@ Retrieve from hcaptcha or turnstile account
 `SECURITY_UPDATE_PASSWORD_REQUIRE_REAUTHENTICATION` - `bool`
 
 Enforce reauthentication on password update.
+
+### Anonymous Sign-Ins
+
+`GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED` - `bool`
+
+Use this to enable/disable anonymous sign-ins.
 
 ## Endpoints
 

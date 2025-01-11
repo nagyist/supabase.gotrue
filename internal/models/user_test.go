@@ -1,7 +1,7 @@
 package models
 
 import (
-	"strings"
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +11,7 @@ import (
 	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/storage"
 	"github.com/supabase/auth/internal/storage/test"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const modelsTestConfig = "../../hack/test.env"
@@ -83,8 +84,10 @@ func (ts *UserTestSuite) TestUpdateUserMetadata() {
 
 func (ts *UserTestSuite) TestFindUserByConfirmationToken() {
 	u := ts.createUser()
+	tokenHash := "test_confirmation_token"
+	require.NoError(ts.T(), CreateOneTimeToken(ts.db, u.ID, "relates_to not used", tokenHash, ConfirmationToken))
 
-	n, err := FindUserByConfirmationToken(ts.db, u.ConfirmationToken)
+	n, err := FindUserByConfirmationToken(ts.db, tokenHash)
 	require.NoError(ts.T(), err)
 	require.Equal(ts.T(), u.ID, n.ID)
 }
@@ -136,14 +139,11 @@ func (ts *UserTestSuite) TestFindUserByID() {
 
 func (ts *UserTestSuite) TestFindUserByRecoveryToken() {
 	u := ts.createUser()
-	u.RecoveryToken = "asdf"
+	tokenHash := "test_recovery_token"
+	require.NoError(ts.T(), CreateOneTimeToken(ts.db, u.ID, "relates_to not used", tokenHash, RecoveryToken))
 
-	err := ts.db.Update(u)
+	n, err := FindUserByRecoveryToken(ts.db, tokenHash)
 	require.NoError(ts.T(), err)
-
-	n, err := FindUserByRecoveryToken(ts.db, u.RecoveryToken)
-	require.NoError(ts.T(), err)
-
 	require.Equal(ts.T(), u.ID, n.ID)
 }
 
@@ -325,14 +325,14 @@ func (ts *UserTestSuite) TestUpdateUserEmailSuccess() {
 	require.NoError(ts.T(), ts.db.Create(secondaryIdentity))
 
 	// UpdateUserEmail should not do anything and the user's email should still use the primaryIdentity
-	require.NoError(ts.T(), userA.UpdateUserEmail(ts.db))
+	require.NoError(ts.T(), userA.UpdateUserEmailFromIdentities(ts.db))
 	require.Equal(ts.T(), primaryIdentity.GetEmail(), userA.GetEmail())
 
 	// remove primary identity
 	require.NoError(ts.T(), ts.db.Destroy(primaryIdentity))
 
 	// UpdateUserEmail should update the user to use the secondary identity's email
-	require.NoError(ts.T(), userA.UpdateUserEmail(ts.db))
+	require.NoError(ts.T(), userA.UpdateUserEmailFromIdentities(ts.db))
 	require.Equal(ts.T(), secondaryIdentity.GetEmail(), userA.GetEmail())
 }
 
@@ -364,18 +364,104 @@ func (ts *UserTestSuite) TestUpdateUserEmailFailure() {
 
 	// UpdateUserEmail should fail with the email unique constraint violation error
 	//  since userB is using the secondary identity's email
-	require.ErrorIs(ts.T(), userA.UpdateUserEmail(ts.db), UserEmailUniqueConflictError{})
+	require.ErrorIs(ts.T(), userA.UpdateUserEmailFromIdentities(ts.db), UserEmailUniqueConflictError{})
 	require.Equal(ts.T(), primaryIdentity.GetEmail(), userA.GetEmail())
 }
 
-func (ts *UserTestSuite) TestSetPasswordTooLong() {
-	user, err := NewUser("", "", strings.Repeat("a", crypto.MaxPasswordLength), "", nil)
-	require.NoError(ts.T(), err)
-	require.NoError(ts.T(), ts.db.Create(user))
+func (ts *UserTestSuite) TestNewUserWithPasswordHashSuccess() {
+	cases := []struct {
+		desc string
+		hash string
+	}{
+		{
+			desc: "Valid bcrypt hash",
+			hash: "$2y$10$SXEz2HeT8PUIGQXo9yeUIem8KzNxgG0d7o/.eGj2rj8KbRgAuRVlq",
+		},
+		{
+			desc: "Valid argon2i hash",
+			hash: "$argon2i$v=19$m=16,t=2,p=1$bGJRWThNOHJJTVBSdHl2dQ$NfEnUOuUpb7F2fQkgFUG4g",
+		},
+		{
+			desc: "Valid argon2id hash",
+			hash: "$argon2id$v=19$m=32,t=3,p=2$SFVpOWJ0eXhjRzVkdGN1RQ$RXnb8rh7LaDcn07xsssqqulZYXOM/EUCEFMVcAcyYVk",
+		},
+		{
+			desc: "Valid Firebase scrypt hash",
+			hash: "$fbscrypt$v=1,n=14,r=8,p=1,ss=Bw==,sk=ou9tdYTGyYm8kuR6Dt0Bp0kDuAYoXrK16mbZO4yGwAn3oLspjnN0/c41v8xZnO1n14J3MjKj1b2g6AUCAlFwMw==$C0sHCg9ek77hsg==$ZGlmZmVyZW50aGFzaA==",
+		},
+	}
 
-	err = user.SetPassword(ts.db.Context(), strings.Repeat("a", crypto.MaxPasswordLength+1))
-	require.Error(ts.T(), err)
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			u, err := NewUserWithPasswordHash("", "", c.hash, "", nil)
+			require.NoError(ts.T(), err)
+			require.NotNil(ts.T(), u)
+		})
+	}
+}
 
-	err = user.SetPassword(ts.db.Context(), strings.Repeat("a", crypto.MaxPasswordLength))
-	require.NoError(ts.T(), err)
+func (ts *UserTestSuite) TestNewUserWithPasswordHashFailure() {
+	cases := []struct {
+		desc string
+		hash string
+	}{
+		{
+			desc: "Invalid argon2i hash",
+			hash: "$argon2id$test",
+		},
+		{
+			desc: "Invalid bcrypt hash",
+			hash: "plaintest_password",
+		},
+		{
+			desc: "Invalid scrypt hash",
+			hash: "$fbscrypt$invalid",
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			u, err := NewUserWithPasswordHash("", "", c.hash, "", nil)
+			require.Error(ts.T(), err)
+			require.Nil(ts.T(), u)
+		})
+	}
+}
+
+func (ts *UserTestSuite) TestAuthenticate() {
+	// every case uses "test" as the password
+	cases := []struct {
+		desc             string
+		hash             string
+		expectedHashCost int
+	}{
+		{
+			desc:             "Invalid bcrypt hash cost of 11",
+			hash:             "$2y$11$4lH57PU7bGATpRcx93vIoObH3qDmft/pytbOzDG9/1WsyNmN5u4di",
+			expectedHashCost: bcrypt.MinCost,
+		},
+		{
+			desc:             "Valid bcrypt hash cost of 10",
+			hash:             "$2y$10$va66S4MxFrH6G6L7BzYl0.QgcYgvSr/F92gc.3botlz7bG4p/g/1i",
+			expectedHashCost: bcrypt.DefaultCost,
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			u, err := NewUserWithPasswordHash("", "", c.hash, "", nil)
+			require.NoError(ts.T(), err)
+			require.NoError(ts.T(), ts.db.Create(u))
+			require.NotNil(ts.T(), u)
+
+			isAuthenticated, _, err := u.Authenticate(context.Background(), ts.db, "test", nil, false, "")
+			require.NoError(ts.T(), err)
+			require.True(ts.T(), isAuthenticated)
+
+			// check hash cost
+			hashCost, err := bcrypt.Cost([]byte(*u.EncryptedPassword))
+			require.NoError(ts.T(), err)
+			require.Equal(ts.T(), c.expectedHashCost, hashCost)
+		})
+	}
 }

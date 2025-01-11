@@ -1,17 +1,37 @@
 package mailer
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/badoux/checkmail"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/models"
 )
 
+type MailRequest struct {
+	To              string
+	SubjectTemplate string
+	TemplateURL     string
+	DefaultTemplate string
+	TemplateData    map[string]interface{}
+	Headers         map[string][]string
+	Type            string
+}
+
 type MailClient interface {
-	Mail(string, string, string, string, map[string]interface{}) error
+	Mail(
+		ctx context.Context,
+		to string,
+		subjectTemplate string,
+		templateURL string,
+		defaultTemplate string,
+		templateData map[string]interface{},
+		headers map[string][]string,
+		typ string,
+	) error
 }
 
 // TemplateMailer will send mail and use templates from the site for easy mail styling
@@ -32,6 +52,18 @@ func encodeRedirectURL(referrerURL string) string {
 	}
 	return referrerURL
 }
+
+const (
+	SignupVerification             = "signup"
+	RecoveryVerification           = "recovery"
+	InviteVerification             = "invite"
+	MagicLinkVerification          = "magiclink"
+	EmailChangeVerification        = "email_change"
+	EmailOTPVerification           = "email"
+	EmailChangeCurrentVerification = "email_change_current"
+	EmailChangeNewVerification     = "email_change_new"
+	ReauthenticationVerification   = "reauthentication"
+)
 
 const defaultInviteMail = `<h2>You have been invited</h2>
 
@@ -68,14 +100,43 @@ const defaultReauthenticateMail = `<h2>Confirm reauthentication</h2>
 
 <p>Enter the code: {{ .Token }}</p>`
 
-// ValidateEmail returns nil if the email is valid,
-// otherwise an error indicating the reason it is invalid
-func (m TemplateMailer) ValidateEmail(email string) error {
-	return checkmail.ValidateFormat(email)
+func (m *TemplateMailer) Headers(messageType string) map[string][]string {
+	originalHeaders := m.Config.SMTP.NormalizedHeaders()
+
+	if originalHeaders == nil {
+		return nil
+	}
+
+	headers := make(map[string][]string, len(originalHeaders))
+
+	for header, values := range originalHeaders {
+		replacedValues := make([]string, 0, len(values))
+
+		if header == "" {
+			continue
+		}
+
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+
+			// TODO: in the future, use a templating engine to add more contextual data available to headers
+			if strings.Contains(value, "$messageType") {
+				replacedValues = append(replacedValues, strings.ReplaceAll(value, "$messageType", messageType))
+			} else {
+				replacedValues = append(replacedValues, value)
+			}
+		}
+
+		headers[header] = replacedValues
+	}
+
+	return headers
 }
 
 // InviteMail sends a invite mail to a new user
-func (m *TemplateMailer) InviteMail(user *models.User, otp, referrerURL string, externalURL *url.URL) error {
+func (m *TemplateMailer) InviteMail(r *http.Request, user *models.User, otp, referrerURL string, externalURL *url.URL) error {
 	path, err := getPath(m.Config.Mailer.URLPaths.Invite, &EmailParams{
 		Token:      user.ConfirmationToken,
 		Type:       "invite",
@@ -97,16 +158,19 @@ func (m *TemplateMailer) InviteMail(user *models.User, otp, referrerURL string, 
 	}
 
 	return m.Mailer.Mail(
+		r.Context(),
 		user.GetEmail(),
 		withDefault(m.Config.Mailer.Subjects.Invite, "You have been invited"),
 		m.Config.Mailer.Templates.Invite,
 		defaultInviteMail,
 		data,
+		m.Headers("invite"),
+		"invite",
 	)
 }
 
 // ConfirmationMail sends a signup confirmation mail to a new user
-func (m *TemplateMailer) ConfirmationMail(user *models.User, otp, referrerURL string, externalURL *url.URL) error {
+func (m *TemplateMailer) ConfirmationMail(r *http.Request, user *models.User, otp, referrerURL string, externalURL *url.URL) error {
 	path, err := getPath(m.Config.Mailer.URLPaths.Confirmation, &EmailParams{
 		Token:      user.ConfirmationToken,
 		Type:       "signup",
@@ -127,16 +191,19 @@ func (m *TemplateMailer) ConfirmationMail(user *models.User, otp, referrerURL st
 	}
 
 	return m.Mailer.Mail(
+		r.Context(),
 		user.GetEmail(),
 		withDefault(m.Config.Mailer.Subjects.Confirmation, "Confirm Your Email"),
 		m.Config.Mailer.Templates.Confirmation,
 		defaultConfirmationMail,
 		data,
+		m.Headers("confirm"),
+		"confirm",
 	)
 }
 
 // ReauthenticateMail sends a reauthentication mail to an authenticated user
-func (m *TemplateMailer) ReauthenticateMail(user *models.User, otp string) error {
+func (m *TemplateMailer) ReauthenticateMail(r *http.Request, user *models.User, otp string) error {
 	data := map[string]interface{}{
 		"SiteURL": m.Config.SiteURL,
 		"Email":   user.Email,
@@ -145,16 +212,19 @@ func (m *TemplateMailer) ReauthenticateMail(user *models.User, otp string) error
 	}
 
 	return m.Mailer.Mail(
+		r.Context(),
 		user.GetEmail(),
 		withDefault(m.Config.Mailer.Subjects.Reauthentication, "Confirm reauthentication"),
 		m.Config.Mailer.Templates.Reauthentication,
 		defaultReauthenticateMail,
 		data,
+		m.Headers("reauthenticate"),
+		"reauthenticate",
 	)
 }
 
 // EmailChangeMail sends an email change confirmation mail to a user
-func (m *TemplateMailer) EmailChangeMail(user *models.User, otpNew, otpCurrent, referrerURL string, externalURL *url.URL) error {
+func (m *TemplateMailer) EmailChangeMail(r *http.Request, user *models.User, otpNew, otpCurrent, referrerURL string, externalURL *url.URL) error {
 	type Email struct {
 		Address   string
 		Otp       string
@@ -183,7 +253,10 @@ func (m *TemplateMailer) EmailChangeMail(user *models.User, otpNew, otpCurrent, 
 		})
 	}
 
-	errors := make(chan error)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	errors := make(chan error, len(emails))
 	for _, email := range emails {
 		path, err := getPath(
 			m.Config.Mailer.URLPaths.EmailChange,
@@ -209,11 +282,14 @@ func (m *TemplateMailer) EmailChangeMail(user *models.User, otpNew, otpCurrent, 
 				"RedirectTo":      referrerURL,
 			}
 			errors <- m.Mailer.Mail(
+				ctx,
 				address,
 				withDefault(m.Config.Mailer.Subjects.EmailChange, "Confirm Email Change"),
 				template,
 				defaultEmailChangeMail,
 				data,
+				m.Headers("email_change"),
+				"email_change",
 			)
 		}(email.Address, email.Otp, email.TokenHash, email.Template)
 	}
@@ -224,12 +300,11 @@ func (m *TemplateMailer) EmailChangeMail(user *models.User, otpNew, otpCurrent, 
 			return e
 		}
 	}
-
 	return nil
 }
 
 // RecoveryMail sends a password recovery mail
-func (m *TemplateMailer) RecoveryMail(user *models.User, otp, referrerURL string, externalURL *url.URL) error {
+func (m *TemplateMailer) RecoveryMail(r *http.Request, user *models.User, otp, referrerURL string, externalURL *url.URL) error {
 	path, err := getPath(m.Config.Mailer.URLPaths.Recovery, &EmailParams{
 		Token:      user.RecoveryToken,
 		Type:       "recovery",
@@ -249,16 +324,19 @@ func (m *TemplateMailer) RecoveryMail(user *models.User, otp, referrerURL string
 	}
 
 	return m.Mailer.Mail(
+		r.Context(),
 		user.GetEmail(),
 		withDefault(m.Config.Mailer.Subjects.Recovery, "Reset Your Password"),
 		m.Config.Mailer.Templates.Recovery,
 		defaultRecoveryMail,
 		data,
+		m.Headers("recovery"),
+		"recovery",
 	)
 }
 
 // MagicLinkMail sends a login link mail
-func (m *TemplateMailer) MagicLinkMail(user *models.User, otp, referrerURL string, externalURL *url.URL) error {
+func (m *TemplateMailer) MagicLinkMail(r *http.Request, user *models.User, otp, referrerURL string, externalURL *url.URL) error {
 	path, err := getPath(m.Config.Mailer.URLPaths.Recovery, &EmailParams{
 		Token:      user.RecoveryToken,
 		Type:       "magiclink",
@@ -279,22 +357,14 @@ func (m *TemplateMailer) MagicLinkMail(user *models.User, otp, referrerURL strin
 	}
 
 	return m.Mailer.Mail(
+		r.Context(),
 		user.GetEmail(),
 		withDefault(m.Config.Mailer.Subjects.MagicLink, "Your Magic Link"),
 		m.Config.Mailer.Templates.MagicLink,
 		defaultMagicLinkMail,
 		data,
-	)
-}
-
-// Send can be used to send one-off emails to users
-func (m TemplateMailer) Send(user *models.User, subject, body string, data map[string]interface{}) error {
-	return m.Mailer.Mail(
-		user.GetEmail(),
-		subject,
-		"",
-		body,
-		data,
+		m.Headers("magiclink"),
+		"magiclink",
 	)
 }
 

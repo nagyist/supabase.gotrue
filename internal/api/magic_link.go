@@ -3,15 +3,14 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
-	"github.com/sethvargo/go-password/password"
+	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
-	"github.com/supabase/auth/internal/utilities"
 )
 
 // MagicLinkParams holds the parameters for a magic link request
@@ -22,12 +21,12 @@ type MagicLinkParams struct {
 	CodeChallenge       string                 `json:"code_challenge"`
 }
 
-func (p *MagicLinkParams) Validate() error {
+func (p *MagicLinkParams) Validate(a *API) error {
 	if p.Email == "" {
-		return unprocessableEntityError("Password recovery requires an email")
+		return unprocessableEntityError(ErrorCodeValidationFailed, "Password recovery requires an email")
 	}
 	var err error
-	p.Email, err = validateEmail(p.Email)
+	p.Email, err = a.validateEmail(p.Email)
 	if err != nil {
 		return err
 	}
@@ -44,17 +43,21 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	config := a.config
 
 	if !config.External.Email.Enabled {
-		return badRequestError("Email logins are disabled")
+		return unprocessableEntityError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
+	}
+
+	if !config.External.Email.MagicLinkEnabled {
+		return unprocessableEntityError(ErrorCodeEmailProviderDisabled, "Login with magic link is disabled")
 	}
 
 	params := &MagicLinkParams{}
 	jsonDecoder := json.NewDecoder(r.Body)
 	err := jsonDecoder.Decode(params)
 	if err != nil {
-		return badRequestError("Could not read verification params: %v", err)
+		return badRequestError(ErrorCodeBadJSON, "Could not read verification params: %v", err).WithInternalError(err)
 	}
 
-	if err := params.Validate(); err != nil {
+	if err := params.Validate(a); err != nil {
 		return err
 	}
 
@@ -80,10 +83,7 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 	if isNewUser {
 		// User either doesn't exist or hasn't completed the signup process.
 		// Sign them up with temporary password.
-		password, err := password.Generate(64, 10, 1, false, true)
-		if err != nil {
-			internalServerError("error creating user").WithInternalError(err)
-		}
+		password := crypto.GeneratePassword(config.Password.RequiredCharacters, 33)
 
 		signUpParams := &SignupParams{
 			Email:               params.Email,
@@ -94,7 +94,8 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 		}
 		newBodyContent, err := json.Marshal(signUpParams)
 		if err != nil {
-			return badRequestError("Could not parse metadata: %v", err)
+			// SignupParams must always be marshallable
+			panic(fmt.Errorf("failed to marshal SignupParams: %w", err))
 		}
 		r.Body = io.NopCloser(strings.NewReader(string(newBodyContent)))
 		r.ContentLength = int64(len(string(newBodyContent)))
@@ -113,7 +114,8 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 			}
 			metadata, err := json.Marshal(newBodyContent)
 			if err != nil {
-				return badRequestError("Could not parse metadata: %v", err)
+				// SignupParams must always be marshallable
+				panic(fmt.Errorf("failed to marshal SignupParams: %w", err))
 			}
 			r.Body = io.NopCloser(bytes.NewReader(metadata))
 			return a.MagicLink(w, r)
@@ -126,31 +128,20 @@ func (a *API) MagicLink(w http.ResponseWriter, r *http.Request) error {
 		return sendJSON(w, http.StatusOK, make(map[string]string))
 	}
 
+	if isPKCEFlow(flowType) {
+		if _, err = generateFlowState(a.db, models.MagicLink.String(), models.MagicLink, params.CodeChallengeMethod, params.CodeChallenge, &user.ID); err != nil {
+			return err
+		}
+	}
+
 	err = db.Transaction(func(tx *storage.Connection) error {
 		if terr := models.NewAuditLogEntry(r, tx, user, models.UserRecoveryRequestedAction, "", nil); terr != nil {
 			return terr
 		}
-
-		if isPKCEFlow(flowType) {
-			codeChallengeMethod, terr := models.ParseCodeChallengeMethod(params.CodeChallengeMethod)
-			if terr != nil {
-				return terr
-			}
-			if terr := models.NewFlowStateWithUserID(tx, models.MagicLink.String(), params.CodeChallenge, codeChallengeMethod, models.MagicLink, &user.ID); terr != nil {
-				return terr
-			}
-		}
-
-		mailer := a.Mailer(ctx)
-		referrer := utilities.GetReferrer(r, config)
-		externalURL := getExternalHost(ctx)
-		return a.sendMagicLink(tx, user, mailer, config.SMTP.MaxFrequency, referrer, externalURL, config.Mailer.OtpLength, flowType)
+		return a.sendMagicLink(r, tx, user, flowType)
 	})
 	if err != nil {
-		if errors.Is(err, MaxFrequencyLimitError) {
-			return tooManyRequestsError("For security purposes, you can only request this once every 60 seconds")
-		}
-		return internalServerError("Error sending magic link").WithInternalError(err)
+		return err
 	}
 
 	return sendJSON(w, http.StatusOK, make(map[string]string))

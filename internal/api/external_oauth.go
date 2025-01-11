@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/observability"
+	"github.com/supabase/auth/internal/utilities"
 )
 
 // OAuthProviderData contains the userData and token returned by the oauth provider
@@ -22,17 +24,6 @@ type OAuthProviderData struct {
 // loadFlowState parses the `state` query parameter as a JWS payload,
 // extracting the provider requested
 func (a *API) loadFlowState(w http.ResponseWriter, r *http.Request) (context.Context, error) {
-	var state string
-	if r.Method == http.MethodPost {
-		state = r.FormValue("state")
-	} else {
-		state = r.URL.Query().Get("state")
-	}
-
-	if state == "" {
-		return nil, badRequestError("OAuth state parameter missing")
-	}
-
 	ctx := r.Context()
 	oauthToken := r.URL.Query().Get("oauth_token")
 	if oauthToken != "" {
@@ -42,7 +33,21 @@ func (a *API) loadFlowState(w http.ResponseWriter, r *http.Request) (context.Con
 	if oauthVerifier != "" {
 		ctx = withOAuthVerifier(ctx, oauthVerifier)
 	}
-	return a.loadExternalState(ctx, state)
+
+	var err error
+	ctx, err = a.loadExternalState(ctx, r)
+	if err != nil {
+		u, uerr := url.ParseRequestURI(a.config.SiteURL)
+		if uerr != nil {
+			return ctx, internalServerError("site url is improperly formatted").WithInternalError(uerr)
+		}
+
+		q := getErrorQueryString(err, utilities.GetRequestID(ctx), observability.GetLogEntry(r).Entry, u.Query())
+		u.RawQuery = q.Encode()
+
+		http.Redirect(w, r, u.String(), http.StatusSeeOther)
+	}
+	return ctx, err
 }
 
 func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType string) (*OAuthProviderData, error) {
@@ -60,15 +65,15 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 
 	oauthCode := rq.Get("code")
 	if oauthCode == "" {
-		return nil, badRequestError("Authorization code missing")
+		return nil, badRequestError(ErrorCodeBadOAuthCallback, "OAuth callback with missing authorization code missing")
 	}
 
 	oAuthProvider, err := a.OAuthProvider(ctx, providerType)
 	if err != nil {
-		return nil, badRequestError("Unsupported provider: %+v", err).WithInternalError(err)
+		return nil, badRequestError(ErrorCodeOAuthProviderNotSupported, "Unsupported provider: %+v", err).WithInternalError(err)
 	}
 
-	log := observability.GetLogEntry(r)
+	log := observability.GetLogEntry(r).Entry
 	log.WithFields(logrus.Fields{
 		"provider": providerType,
 		"code":     oauthCode,
@@ -104,10 +109,10 @@ func (a *API) oAuthCallback(ctx context.Context, r *http.Request, providerType s
 	}, nil
 }
 
-func (a *API) oAuth1Callback(ctx context.Context, r *http.Request, providerType string) (*OAuthProviderData, error) {
+func (a *API) oAuth1Callback(ctx context.Context, providerType string) (*OAuthProviderData, error) {
 	oAuthProvider, err := a.OAuthProvider(ctx, providerType)
 	if err != nil {
-		return nil, badRequestError("Unsupported provider: %+v", err).WithInternalError(err)
+		return nil, badRequestError(ErrorCodeOAuthProviderNotSupported, "Unsupported provider: %+v", err).WithInternalError(err)
 	}
 	oauthToken := getRequestToken(ctx)
 	oauthVerifier := getOAuthVerifier(ctx)
@@ -145,6 +150,6 @@ func (a *API) OAuthProvider(ctx context.Context, name string) (provider.OAuthPro
 	case provider.OAuthProvider:
 		return p, nil
 	default:
-		return nil, badRequestError("Provider can not be used for OAuth")
+		return nil, fmt.Errorf("Provider %v cannot be used for OAuth", name)
 	}
 }

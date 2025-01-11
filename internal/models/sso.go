@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"time"
 
@@ -36,6 +37,7 @@ type SAMLAttribute struct {
 	Name    string      `json:"name,omitempty"`
 	Names   []string    `json:"names,omitempty"`
 	Default interface{} `json:"default,omitempty"`
+	Array   bool        `json:"array,omitempty"`
 }
 
 type SAMLAttributeMapping struct {
@@ -75,7 +77,11 @@ func (m *SAMLAttributeMapping) Equal(o *SAMLAttributeMapping) bool {
 			}
 		}
 
-		if mvalue.Default != value.Default {
+		if !reflect.DeepEqual(mvalue.Default, value.Default) {
+			return false
+		}
+
+		if mvalue.Array != value.Array {
 			return false
 		}
 	}
@@ -114,6 +120,8 @@ type SAMLProvider struct {
 	MetadataURL *string `db:"metadata_url" json:"metadata_url,omitempty"`
 
 	AttributeMapping SAMLAttributeMapping `db:"attribute_mapping" json:"attribute_mapping,omitempty"`
+
+	NameIDFormat *string `db:"name_id_format" json:"name_id_format,omitempty"`
 
 	CreatedAt time.Time `db:"created_at" json:"-"`
 	UpdatedAt time.Time `db:"updated_at" json:"-"`

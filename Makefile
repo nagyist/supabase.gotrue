@@ -3,7 +3,7 @@ CHECK_FILES?=./...
 
 FLAGS=-ldflags "-X github.com/supabase/auth/internal/utilities.Version=`git describe --tags`" -buildvcs=false
 ifdef RELEASE_VERSION
-	FLAGS=-ldflags "-X github.com/supabase/auth/internal/utilities.Version=$(RELEASE_VERSION)" -buildvcs=false
+	FLAGS=-ldflags "-X github.com/supabase/auth/internal/utilities.Version=v$(RELEASE_VERSION)" -buildvcs=false
 endif
 
 DEV_DOCKER_COMPOSE:=docker-compose-dev.yml
@@ -22,6 +22,7 @@ dev-deps: ## Install developer dependencies
 	@go install github.com/securego/gosec/v2/cmd/gosec@latest
 	@go install honnef.co/go/tools/cmd/staticcheck@latest
 	@go install github.com/deepmap/oapi-codegen/cmd/oapi-codegen@latest
+	@go install github.com/nishanths/exhaustive/cmd/exhaustive@latest
 
 deps: ## Install dependencies.
 	@go mod download
@@ -35,6 +36,7 @@ migrate_test: ## Run database migrations for test.
 
 test: build ## Run tests.
 	go test $(CHECK_FILES) -coverprofile=coverage.out -coverpkg ./... -p 1 -race -v -count=1
+	./hack/coverage.sh
 
 vet: # Vet the code
 	go vet $(CHECK_FILES)
@@ -54,6 +56,7 @@ unused: dev-deps # Look for unused code
 
 static: dev-deps
 	staticcheck ./...
+	exhaustive ./...
 
 generate: dev-deps
 	go generate ./...

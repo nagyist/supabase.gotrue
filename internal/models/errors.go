@@ -9,6 +9,8 @@ func IsNotFoundError(err error) bool {
 		return true
 	case ConfirmationTokenNotFoundError, *ConfirmationTokenNotFoundError:
 		return true
+	case ConfirmationOrRecoveryTokenNotFoundError, *ConfirmationOrRecoveryTokenNotFoundError:
+		return true
 	case RefreshTokenNotFoundError, *RefreshTokenNotFoundError:
 		return true
 	case IdentityNotFoundError, *IdentityNotFoundError:
@@ -22,6 +24,8 @@ func IsNotFoundError(err error) bool {
 	case SAMLRelayStateNotFoundError, *SAMLRelayStateNotFoundError:
 		return true
 	case FlowStateNotFoundError, *FlowStateNotFoundError:
+		return true
+	case OneTimeTokenNotFoundError, *OneTimeTokenNotFoundError:
 		return true
 	}
 	return false

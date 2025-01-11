@@ -8,6 +8,7 @@ const RELEASE_AS_DIRECTIVE = /^\s*Release-As:/im;
 const BREAKING_CHANGE_DIRECTIVE = /^\s*BREAKING[ \t]+CHANGE:/im;
 
 const ALLOWED_CONVENTIONAL_COMMIT_PREFIXES = [
+  "revert",
   "feat",
   "fix",
   "ci",
@@ -16,7 +17,7 @@ const ALLOWED_CONVENTIONAL_COMMIT_PREFIXES = [
 ];
 
 const object = process.argv[2];
-const payload = JSON.parse(fs.readFileSync(process.stdin.fd, "utf-8"));
+const payload = JSON.parse(fs.readFileSync(process.argv[3], "utf-8"));
 
 let validate = [];
 
@@ -27,10 +28,12 @@ if (object === "pr") {
   });
 } else if (object === "push") {
   validate.push(
-    ...payload.commits.map((commit) => ({
-      title: commit.message.split("\n")[0],
-      content: commit.message,
-    })),
+    ...payload.commits
+      .map((commit) => ({
+        title: commit.message.split("\n")[0],
+        content: commit.message,
+      }))
+      .filter(({ title }) => !title.startsWith("Merge branch ") && !title.startsWith("Revert ")),
   );
 } else {
   console.error(
@@ -43,7 +46,12 @@ let failed = false;
 
 validate.forEach((payload) => {
   if (payload.title) {
-    const { groups } = payload.title.match(TITLE_PATTERN);
+    const match = payload.title.match(TITLE_PATTERN);
+    if (!match) {
+      return
+    }
+
+    const { groups } = match
 
     if (groups) {
       if (groups.breaking) {

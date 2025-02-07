@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/golang-jwt/jwt"
+	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/conf"
@@ -277,7 +277,7 @@ func (ts *SSOTestSuite) TestAdminCreateSSOProvider() {
 			},
 		},
 		{
-			StatusCode: http.StatusBadRequest,
+			StatusCode: http.StatusUnprocessableEntity,
 			Request: map[string]interface{}{
 				"type":         "saml",
 				"metadata_xml": validSAMLIDPMetadata("https://accounts.google.com/o/saml2?idpid=EXAMPLE-DUPLICATE"),

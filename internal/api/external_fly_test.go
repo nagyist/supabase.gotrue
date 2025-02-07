@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"time"
 
-	jwt "github.com/golang-jwt/jwt"
+	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/supabase/auth/internal/models"
 )
@@ -30,7 +30,7 @@ func (ts *ExternalTestSuite) TestSignupExternalFly() {
 	ts.Equal("read", q.Get("scope"))
 
 	claims := ExternalProviderClaims{}
-	p := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Name}}
+	p := jwt.NewParser(jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}))
 	_, err = p.ParseWithClaims(q.Get("state"), &claims, func(token *jwt.Token) (interface{}, error) {
 		return []byte(ts.Config.JWT.Secret), nil
 	})
@@ -116,7 +116,7 @@ func (ts *ExternalTestSuite) TestSignupExternalFly_PKCE() {
 			require.NoError(ts.T(), err)
 			require.NotEmpty(ts.T(), authCode)
 
-			// Check for valid provider access token, mock does not return refresh toekn
+			// Check for valid provider access token, mock does not return refresh token
 			user, err := models.FindUserByEmailAndAudience(ts.API.db, "fly@example.com", ts.Config.JWT.Aud)
 			require.NoError(ts.T(), err)
 			require.NotEmpty(ts.T(), user)
@@ -260,5 +260,5 @@ func (ts *ExternalTestSuite) TestSignupExternalFlyErrorWhenUserBanned() {
 	require.NoError(ts.T(), ts.API.db.UpdateOnly(user, "banned_until"))
 
 	u = performAuthorization(ts, "fly", code, "")
-	assertAuthorizationFailure(ts, u, "User is unauthorized", "unauthorized_client", "")
+	assertAuthorizationFailure(ts, u, "User is banned", "access_denied", "")
 }

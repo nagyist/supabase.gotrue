@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/golang-jwt/jwt"
+	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -56,15 +55,22 @@ func (ts *InviteTestSuite) makeSuperAdmin(email string) string {
 
 	u, err := models.NewUser("123456789", email, "test", ts.Config.JWT.Aud, map[string]interface{}{"full_name": "Test User"})
 	require.NoError(ts.T(), err, "Error making new user")
+	require.NoError(ts.T(), ts.API.db.Create(u))
 
 	u.Role = "supabase_admin"
 
 	var token string
-	token, _, err = ts.API.generateAccessToken(context.Background(), ts.API.db, u, nil, models.Invite)
+
+	session, err := models.NewSession(u.ID, nil)
+	require.NoError(ts.T(), err)
+	require.NoError(ts.T(), ts.API.db.Create(session))
+
+	req := httptest.NewRequest(http.MethodPost, "/invite", nil)
+	token, _, err = ts.API.generateAccessToken(req, ts.API.db, u, &session.ID, models.Invite)
 
 	require.NoError(ts.T(), err, "Error generating access token")
 
-	p := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Name}}
+	p := jwt.NewParser(jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}))
 	_, err = p.Parse(token, func(token *jwt.Token) (interface{}, error) {
 		return []byte(ts.Config.JWT.Secret), nil
 	})
@@ -162,7 +168,7 @@ func (ts *InviteTestSuite) TestInvite_WithoutAccess() {
 	w := httptest.NewRecorder()
 
 	ts.API.handler.ServeHTTP(w, req)
-	assert.Equal(ts.T(), http.StatusUnauthorized, w.Code)
+	assert.Equal(ts.T(), http.StatusUnauthorized, w.Code) // 401 OK because the invite request above has no Authorization header
 }
 
 func (ts *InviteTestSuite) TestVerifyInvite() {
@@ -201,10 +207,11 @@ func (ts *InviteTestSuite) TestVerifyInvite() {
 			now := time.Now()
 			user.InvitedAt = &now
 			user.ConfirmationSentAt = &now
-			user.EncryptedPassword = ""
+			user.EncryptedPassword = nil
 			user.ConfirmationToken = crypto.GenerateTokenHash(c.email, c.requestBody["token"].(string))
 			require.NoError(ts.T(), err)
 			require.NoError(ts.T(), ts.API.db.Create(user))
+			require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, user.ID, user.GetEmail(), user.ConfirmationToken, models.ConfirmationToken))
 
 			// Find test user
 			_, err = models.FindUserByEmailAndAudience(ts.API.db, c.email, ts.Config.JWT.Aud)

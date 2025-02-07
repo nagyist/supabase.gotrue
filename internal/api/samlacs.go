@@ -43,13 +43,27 @@ func IsSAMLMetadataStale(idpMetadata *saml.EntityDescriptor, samlProvider models
 	return hasValidityExpired || hasCacheDurationExceeded || needsForceUpdate
 }
 
-// SAMLACS implements the main Assertion Consumer Service endpoint behavior.
-func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
+func (a *API) SamlAcs(w http.ResponseWriter, r *http.Request) error {
+	if err := a.handleSamlAcs(w, r); err != nil {
+		u, uerr := url.Parse(a.config.SiteURL)
+		if uerr != nil {
+			return internalServerError("site url is improperly formattted").WithInternalError(err)
+		}
+
+		q := getErrorQueryString(err, utilities.GetRequestID(r.Context()), observability.GetLogEntry(r).Entry, u.Query())
+		u.RawQuery = q.Encode()
+		http.Redirect(w, r, u.String(), http.StatusSeeOther)
+	}
+	return nil
+}
+
+// handleSamlAcs implements the main Assertion Consumer Service endpoint behavior.
+func (a *API) handleSamlAcs(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 
 	db := a.db.WithContext(ctx)
 	config := a.config
-	log := observability.GetLogEntry(r)
+	log := observability.GetLogEntry(r).Entry
 
 	relayStateValue := r.FormValue("RelayState")
 	relayStateUUID := uuid.FromStringOrNil(relayStateValue)
@@ -61,13 +75,12 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 	var requestIds []string
 
 	var flowState *models.FlowState
-	flowState = nil
 	if relayStateUUID != uuid.Nil {
 		// relay state is a valid UUID, therefore this is likely a SP initiated flow
 
 		relayState, err := models.FindSAMLRelayStateByID(db, relayStateUUID)
 		if models.IsNotFoundError(err) {
-			return badRequestError("SAML RelayState does not exist, try logging in again?")
+			return notFoundError(ErrorCodeSAMLRelayStateNotFound, "SAML RelayState does not exist, try logging in again?")
 		} else if err != nil {
 			return err
 		}
@@ -77,7 +90,7 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 				return internalServerError("SAML RelayState has expired and destroying it failed. Try logging in again?").WithInternalError(err)
 			}
 
-			return badRequestError("SAML RelayState has expired. Try loggin in again?")
+			return unprocessableEntityError(ErrorCodeSAMLRelayStateExpired, "SAML RelayState has expired. Try logging in again?")
 		}
 
 		// TODO: add abuse detection to bind the RelayState UUID with a
@@ -107,23 +120,23 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 			// SAML Artifact responses are possible only when
 			// RelayState can be used to identify the Identity
 			// Provider.
-			return badRequestError("SAML Artifact response can only be used with SP initiated flow")
+			return badRequestError(ErrorCodeValidationFailed, "SAML Artifact response can only be used with SP initiated flow")
 		}
 
 		samlResponse := r.FormValue("SAMLResponse")
 		if samlResponse == "" {
-			return badRequestError("SAMLResponse is missing")
+			return badRequestError(ErrorCodeValidationFailed, "SAMLResponse is missing")
 		}
 
 		responseXML, err := base64.StdEncoding.DecodeString(samlResponse)
 		if err != nil {
-			return badRequestError("SAMLResponse is not a valid Base64 string")
+			return badRequestError(ErrorCodeValidationFailed, "SAMLResponse is not a valid Base64 string")
 		}
 
 		var peekResponse saml.Response
 		err = xml.Unmarshal(responseXML, &peekResponse)
 		if err != nil {
-			return badRequestError("SAMLResponse is not a valid XML SAML assertion")
+			return badRequestError(ErrorCodeValidationFailed, "SAMLResponse is not a valid XML SAML assertion").WithInternalError(err)
 		}
 
 		initiatedBy = "idp"
@@ -131,12 +144,12 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 		redirectTo = relayStateValue
 	} else {
 		// RelayState can't be identified, so SAML flow can't continue
-		return badRequestError("SAML RelayState is not a valid UUID or URL")
+		return badRequestError(ErrorCodeValidationFailed, "SAML RelayState is not a valid UUID or URL")
 	}
 
 	ssoProvider, err := models.FindSAMLProviderByEntityID(db, entityId)
 	if models.IsNotFoundError(err) {
-		return badRequestError("A SAML connection has not been established with this Identity Provider")
+		return notFoundError(ErrorCodeSAMLIdPNotFound, "A SAML connection has not been established with this Identity Provider")
 	} else if err != nil {
 		return err
 	}
@@ -176,10 +189,10 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 	spAssertion, err := serviceProvider.ParseResponse(r, requestIds)
 	if err != nil {
 		if ire, ok := err.(*saml.InvalidResponseError); ok {
-			return badRequestError("SAML Assertion is not valid").WithInternalError(ire.PrivateErr)
+			return badRequestError(ErrorCodeValidationFailed, "SAML Assertion is not valid %s", ire.Response).WithInternalError(ire.PrivateErr)
 		}
 
-		return badRequestError("SAML Assertion is not valid").WithInternalError(err)
+		return badRequestError(ErrorCodeValidationFailed, "SAML Assertion is not valid").WithInternalError(err)
 	}
 
 	assertion := SAMLAssertion{
@@ -188,7 +201,7 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 
 	userID := assertion.UserID()
 	if userID == "" {
-		return badRequestError("SAML Assertion did not contain a persistent Subject Identifier attribute or Subject NameID uniquely identifying this user")
+		return badRequestError(ErrorCodeSAMLAssertionNoUserID, "SAML Assertion did not contain a persistent Subject Identifier attribute or Subject NameID uniquely identifying this user")
 	}
 
 	claims := assertion.Process(ssoProvider.SAMLProvider.AttributeMapping)
@@ -200,7 +213,7 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if email == "" {
-		return badRequestError("SAML Assertion does not contain an email address")
+		return badRequestError(ErrorCodeSAMLAssertionNoEmail, "SAML Assertion does not contain an email address")
 	} else {
 		claims["email"] = email
 	}
@@ -283,7 +296,7 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 
-		token, terr = a.issueRefreshToken(ctx, tx, user, models.SSOSAML, grantParams)
+		token, terr = a.issueRefreshToken(r, tx, user, models.SSOSAML, grantParams)
 
 		if terr != nil {
 			return internalServerError("Unable to issue refresh token from SAML Assertion").WithInternalError(terr)
@@ -292,10 +305,6 @@ func (a *API) SAMLACS(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}); err != nil {
 		return err
-	}
-
-	if err := a.setCookieTokens(config, token, false, w); err != nil {
-		return internalServerError("Failed to set JWT cookie").WithInternalError(err)
 	}
 
 	if !utilities.IsRedirectURLValid(config, redirectTo) {

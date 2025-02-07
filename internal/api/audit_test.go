@@ -1,14 +1,13 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	jwt "github.com/golang-jwt/jwt"
+	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -47,12 +46,19 @@ func (ts *AuditTestSuite) makeSuperAdmin(email string) string {
 	require.NoError(ts.T(), err, "Error making new user")
 
 	u.Role = "supabase_admin"
+	require.NoError(ts.T(), ts.API.db.Create(u))
+
+	session, err := models.NewSession(u.ID, nil)
+	require.NoError(ts.T(), err)
+	require.NoError(ts.T(), ts.API.db.Create(session))
 
 	var token string
-	token, _, err = ts.API.generateAccessToken(context.Background(), ts.API.db, u, nil, models.PasswordGrant)
+
+	req := httptest.NewRequest(http.MethodPost, "/token?grant_type=password", nil)
+	token, _, err = ts.API.generateAccessToken(req, ts.API.db, u, &session.ID, models.PasswordGrant)
 	require.NoError(ts.T(), err, "Error generating access token")
 
-	p := jwt.Parser{ValidMethods: []string{jwt.SigningMethodHS256.Name}}
+	p := jwt.NewParser(jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Name}))
 	_, err = p.Parse(token, func(token *jwt.Token) (interface{}, error) {
 		return []byte(ts.Config.JWT.Secret), nil
 	})

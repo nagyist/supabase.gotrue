@@ -72,6 +72,7 @@ func Dial(config *conf.GlobalConfiguration) (*Connection, error) {
 		Pool:            config.DB.MaxPoolSize,
 		IdlePool:        config.DB.MaxIdlePoolSize,
 		ConnMaxLifetime: config.DB.ConnMaxLifetime,
+		ConnMaxIdleTime: config.DB.ConnMaxIdleTime,
 		Options:         options,
 	})
 	if err != nil {
@@ -144,7 +145,13 @@ func (c *Connection) Transaction(fn func(*Connection) error) error {
 				return err
 			}
 		}); terr != nil {
-			return terr
+			// there exists a race condition when the context deadline is exceeded
+			// and whether the transaction has been committed or not
+			// e.g. if the context deadline has exceeded but the transaction has already been committed,
+			// it won't be possible to perform a rollback on the transaction since the transaction has been closed
+			if !errors.Is(terr, sql.ErrTxDone) {
+				return terr
+			}
 		}
 		return returnErr
 	}
@@ -173,7 +180,7 @@ func getExcludedColumns(model interface{}, includeColumns ...string) ([]string, 
 		cols.Remove(f)
 	}
 
-	xcols := make([]string, len(cols.Cols))
+	xcols := make([]string, 0, len(cols.Cols))
 	for n := range cols.Cols {
 		// gobuffalo updates the updated_at column automatically
 		if n == "updated_at" {

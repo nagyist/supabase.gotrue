@@ -1,7 +1,6 @@
 package api
 
 import (
-	"errors"
 	"net/http"
 
 	"github.com/supabase/auth/internal/api/sms_provider"
@@ -17,22 +16,21 @@ const InvalidNonceMessage = "Nonce has expired or is invalid"
 func (a *API) Reauthenticate(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 
 	user := getUser(ctx)
 	email, phone := user.GetEmail(), user.GetPhone()
 
 	if email == "" && phone == "" {
-		return unprocessableEntityError("Reauthentication requires the user to have an email or a phone number")
+		return badRequestError(ErrorCodeValidationFailed, "Reauthentication requires the user to have an email or a phone number")
 	}
 
 	if email != "" {
 		if !user.IsConfirmed() {
-			return badRequestError("Please verify your email first.")
+			return unprocessableEntityError(ErrorCodeEmailNotConfirmed, "Please verify your email first.")
 		}
 	} else if phone != "" {
 		if !user.IsPhoneConfirmed() {
-			return badRequestError("Please verify your phone first.")
+			return unprocessableEntityError(ErrorCodePhoneNotConfirmed, "Please verify your phone first.")
 		}
 	}
 
@@ -42,14 +40,9 @@ func (a *API) Reauthenticate(w http.ResponseWriter, r *http.Request) error {
 			return terr
 		}
 		if email != "" {
-			mailer := a.Mailer(ctx)
-			return a.sendReauthenticationOtp(tx, user, mailer, config.SMTP.MaxFrequency, config.Mailer.OtpLength)
+			return a.sendReauthenticationOtp(r, tx, user)
 		} else if phone != "" {
-			smsProvider, terr := sms_provider.GetSmsProvider(*config)
-			if terr != nil {
-				return badRequestError("Error sending sms: %v", terr)
-			}
-			mID, err := a.sendPhoneConfirmation(ctx, tx, user, phone, phoneReauthenticationOtp, smsProvider, sms_provider.SMSProvider)
+			mID, err := a.sendPhoneConfirmation(r, tx, user, phone, phoneReauthenticationOtp, sms_provider.SMSProvider)
 			if err != nil {
 				return err
 			}
@@ -59,9 +52,6 @@ func (a *API) Reauthenticate(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, MaxFrequencyLimitError) {
-			return tooManyRequestsError("For security purposes, you can only request this once every 60 seconds")
-		}
 		return err
 	}
 
@@ -77,7 +67,7 @@ func (a *API) Reauthenticate(w http.ResponseWriter, r *http.Request) error {
 // verifyReauthentication checks if the nonce provided is valid
 func (a *API) verifyReauthentication(nonce string, tx *storage.Connection, config *conf.GlobalConfiguration, user *models.User) error {
 	if user.ReauthenticationToken == "" || user.ReauthenticationSentAt == nil {
-		return badRequestError(InvalidNonceMessage)
+		return unprocessableEntityError(ErrorCodeReauthenticationNotValid, InvalidNonceMessage)
 	}
 	var isValid bool
 	if user.GetEmail() != "" {
@@ -87,7 +77,7 @@ func (a *API) verifyReauthentication(nonce string, tx *storage.Connection, confi
 		if config.Sms.IsTwilioVerifyProvider() {
 			smsProvider, _ := sms_provider.GetSmsProvider(*config)
 			if err := smsProvider.(*sms_provider.TwilioVerifyProvider).VerifyOTP(string(user.Phone), nonce); err != nil {
-				return expiredTokenError("Token has expired or is invalid").WithInternalError(err)
+				return forbiddenError(ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalError(err)
 			}
 			return nil
 		} else {
@@ -95,10 +85,10 @@ func (a *API) verifyReauthentication(nonce string, tx *storage.Connection, confi
 			isValid = isOtpValid(tokenHash, user.ReauthenticationToken, user.ReauthenticationSentAt, config.Sms.OtpExp)
 		}
 	} else {
-		return unprocessableEntityError("Reauthentication requires an email or a phone number")
+		return unprocessableEntityError(ErrorCodeReauthenticationNotValid, "Reauthentication requires an email or a phone number")
 	}
 	if !isValid {
-		return badRequestError(InvalidNonceMessage)
+		return unprocessableEntityError(ErrorCodeReauthenticationNotValid, InvalidNonceMessage)
 	}
 	if err := user.ConfirmReauthentication(tx); err != nil {
 		return internalServerError("Error during reauthentication").WithInternalError(err)

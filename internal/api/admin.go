@@ -2,27 +2,30 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/fatih/structs"
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid"
+	"github.com/pkg/errors"
 	"github.com/sethvargo/go-password/password"
 	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/storage"
+	"github.com/supabase/auth/internal/utilities"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type AdminUserParams struct {
+	Id           string                 `json:"id"`
 	Aud          string                 `json:"aud"`
 	Role         string                 `json:"role"`
 	Email        string                 `json:"email"`
 	Phone        string                 `json:"phone"`
 	Password     *string                `json:"password"`
+	PasswordHash string                 `json:"password_hash"`
 	EmailConfirm bool                   `json:"email_confirm"`
 	PhoneConfirm bool                   `json:"phone_confirm"`
 	UserMetaData map[string]interface{} `json:"user_metadata"`
@@ -36,7 +39,7 @@ type adminUserDeleteParams struct {
 
 type adminUserUpdateFactorParams struct {
 	FriendlyName string `json:"friendly_name"`
-	FactorType   string `json:"factor_type"`
+	Phone        string `json:"phone"`
 }
 
 type AdminListUsersResponse struct {
@@ -50,7 +53,7 @@ func (a *API) loadUser(w http.ResponseWriter, r *http.Request) (context.Context,
 
 	userID, err := uuid.FromString(chi.URLParam(r, "user_id"))
 	if err != nil {
-		return nil, badRequestError("user_id must be an UUID")
+		return nil, notFoundError(ErrorCodeValidationFailed, "user_id must be an UUID")
 	}
 
 	observability.LogEntrySetField(r, "user_id", userID)
@@ -58,7 +61,7 @@ func (a *API) loadUser(w http.ResponseWriter, r *http.Request) (context.Context,
 	u, err := models.FindUserByID(db, userID)
 	if err != nil {
 		if models.IsNotFoundError(err) {
-			return nil, notFoundError("User not found")
+			return nil, notFoundError(ErrorCodeUserNotFound, "User not found")
 		}
 		return nil, internalServerError("Database error loading user").WithInternalError(err)
 	}
@@ -66,37 +69,35 @@ func (a *API) loadUser(w http.ResponseWriter, r *http.Request) (context.Context,
 	return withUser(ctx, u), nil
 }
 
+// Use only after requireAuthentication, so that there is a valid user
 func (a *API) loadFactor(w http.ResponseWriter, r *http.Request) (context.Context, error) {
+	ctx := r.Context()
+	db := a.db.WithContext(ctx)
+	user := getUser(ctx)
 	factorID, err := uuid.FromString(chi.URLParam(r, "factor_id"))
 	if err != nil {
-		return nil, badRequestError("factor_id must be an UUID")
+		return nil, notFoundError(ErrorCodeValidationFailed, "factor_id must be an UUID")
 	}
 
 	observability.LogEntrySetField(r, "factor_id", factorID)
 
-	f, err := models.FindFactorByFactorID(a.db, factorID)
+	factor, err := user.FindOwnedFactorByID(db, factorID)
 	if err != nil {
 		if models.IsNotFoundError(err) {
-			return nil, notFoundError("Factor not found")
+			return nil, notFoundError(ErrorCodeMFAFactorNotFound, "Factor not found")
 		}
 		return nil, internalServerError("Database error loading factor").WithInternalError(err)
 	}
-	return withFactor(r.Context(), f), nil
+	return withFactor(ctx, factor), nil
 }
 
 func (a *API) getAdminParams(r *http.Request) (*AdminUserParams, error) {
-	params := AdminUserParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return nil, badRequestError("Could not read body").WithInternalError(err)
+	params := &AdminUserParams{}
+	if err := retrieveRequestParams(r, params); err != nil {
+		return nil, err
 	}
 
-	if err := json.Unmarshal(body, &params); err != nil {
-		return nil, badRequestError("Could not decode admin user params: %v", err)
-	}
-
-	return &params, nil
+	return params, nil
 }
 
 // adminUsers responds with a list of all users in a given audience
@@ -107,12 +108,12 @@ func (a *API) adminUsers(w http.ResponseWriter, r *http.Request) error {
 
 	pageParams, err := paginate(r)
 	if err != nil {
-		return badRequestError("Bad Pagination Parameters: %v", err)
+		return badRequestError(ErrorCodeValidationFailed, "Bad Pagination Parameters: %v", err).WithInternalError(err)
 	}
 
 	sortParams, err := sort(r, map[string]bool{models.CreatedAt: true}, []models.SortField{{Name: models.CreatedAt, Dir: models.Descending}})
 	if err != nil {
-		return badRequestError("Bad Sort Parameters: %v", err)
+		return badRequestError(ErrorCodeValidationFailed, "Bad Sort Parameters: %v", err)
 	}
 
 	filter := r.URL.Query().Get("filter")
@@ -140,6 +141,7 @@ func (a *API) adminUserGet(w http.ResponseWriter, r *http.Request) error {
 func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
+	config := a.config
 	user := getUser(ctx)
 	adminUser := getAdminUser(ctx)
 	params, err := a.getAdminParams(r)
@@ -148,7 +150,7 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if params.Email != "" {
-		params.Email, err = validateEmail(params.Email)
+		params.Email, err = a.validateEmail(params.Email)
 		if err != nil {
 			return err
 		}
@@ -161,17 +163,16 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
+	var banDuration *time.Duration
 	if params.BanDuration != "" {
 		duration := time.Duration(0)
 		if params.BanDuration != "none" {
 			duration, err = time.ParseDuration(params.BanDuration)
 			if err != nil {
-				return badRequestError("invalid format for ban duration: %v", err)
+				return badRequestError(ErrorCodeValidationFailed, "invalid format for ban duration: %v", err)
 			}
 		}
-		if terr := user.Ban(a.db, duration); terr != nil {
-			return terr
-		}
+		banDuration = &duration
 	}
 
 	if params.Password != nil {
@@ -181,7 +182,7 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 
-		if err := user.SetPassword(ctx, password); err != nil {
+		if err := user.SetPassword(ctx, password, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
 			return err
 		}
 	}
@@ -219,8 +220,9 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 				// if the user doesn't have an existing email
 				// then updating the user's email should create a new email identity
 				i, terr := a.createNewIdentity(tx, user, "email", structs.Map(provider.Claims{
-					Subject: user.ID.String(),
-					Email:   params.Email,
+					Subject:       user.ID.String(),
+					Email:         params.Email,
+					EmailVerified: params.EmailConfirm,
 				}))
 				if terr != nil {
 					return terr
@@ -229,11 +231,19 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			} else {
 				// update the existing email identity
 				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
-					"email": params.Email,
+					"email":          params.Email,
+					"email_verified": params.EmailConfirm,
 				}); terr != nil {
 					return terr
 				}
 			}
+			if user.IsAnonymous && params.EmailConfirm {
+				user.IsAnonymous = false
+				if terr := tx.UpdateOnly(user, "is_anonymous"); terr != nil {
+					return terr
+				}
+			}
+
 			if terr := user.SetEmail(tx, params.Email); terr != nil {
 				return terr
 			}
@@ -246,8 +256,9 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 				// if the user doesn't have an existing phone
 				// then updating the user's phone should create a new phone identity
 				identity, terr := a.createNewIdentity(tx, user, "phone", structs.Map(provider.Claims{
-					Subject: user.ID.String(),
-					Phone:   params.Phone,
+					Subject:       user.ID.String(),
+					Phone:         params.Phone,
+					PhoneVerified: params.PhoneConfirm,
 				}))
 				if terr != nil {
 					return terr
@@ -256,8 +267,15 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			} else {
 				// update the existing phone identity
 				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
-					"phone": params.Phone,
+					"phone":          params.Phone,
+					"phone_verified": params.PhoneConfirm,
 				}); terr != nil {
+					return terr
+				}
+			}
+			if user.IsAnonymous && params.PhoneConfirm {
+				user.IsAnonymous = false
+				if terr := tx.UpdateOnly(user, "is_anonymous"); terr != nil {
 					return terr
 				}
 			}
@@ -275,6 +293,12 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 
 		if params.UserMetaData != nil {
 			if terr := user.UpdateUserMetaData(tx, params.UserMetaData); terr != nil {
+				return terr
+			}
+		}
+
+		if banDuration != nil {
+			if terr := user.Ban(tx, *banDuration); terr != nil {
 				return terr
 			}
 		}
@@ -314,19 +338,19 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if params.Email == "" && params.Phone == "" {
-		return unprocessableEntityError("Cannot create a user without either an email or phone")
+		return badRequestError(ErrorCodeValidationFailed, "Cannot create a user without either an email or phone")
 	}
 
 	var providers []string
 	if params.Email != "" {
-		params.Email, err = validateEmail(params.Email)
+		params.Email, err = a.validateEmail(params.Email)
 		if err != nil {
 			return err
 		}
 		if user, err := models.IsDuplicatedEmail(db, params.Email, aud, nil); err != nil {
 			return internalServerError("Database error checking email").WithInternalError(err)
 		} else if user != nil {
-			return unprocessableEntityError(DuplicateEmailMsg)
+			return unprocessableEntityError(ErrorCodeEmailExists, DuplicateEmailMsg)
 		}
 		providers = append(providers, "email")
 	}
@@ -339,12 +363,16 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 		if exists, err := models.IsDuplicatedPhone(db, params.Phone, aud); err != nil {
 			return internalServerError("Database error checking phone").WithInternalError(err)
 		} else if exists {
-			return unprocessableEntityError("Phone number already registered by another user")
+			return unprocessableEntityError(ErrorCodePhoneExists, "Phone number already registered by another user")
 		}
 		providers = append(providers, "phone")
 	}
 
-	if params.Password == nil || *params.Password == "" {
+	if params.Password != nil && params.PasswordHash != "" {
+		return badRequestError(ErrorCodeValidationFailed, "Only a password or a password hash should be provided")
+	}
+
+	if (params.Password == nil || *params.Password == "") && params.PasswordHash == "" {
 		password, err := password.Generate(64, 10, 0, false, true)
 		if err != nil {
 			return internalServerError("Error generating password").WithInternalError(err)
@@ -352,9 +380,29 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 		params.Password = &password
 	}
 
-	user, err := models.NewUser(params.Phone, params.Email, *params.Password, aud, params.UserMetaData)
+	var user *models.User
+	if params.PasswordHash != "" {
+		user, err = models.NewUserWithPasswordHash(params.Phone, params.Email, params.PasswordHash, aud, params.UserMetaData)
+	} else {
+		user, err = models.NewUser(params.Phone, params.Email, *params.Password, aud, params.UserMetaData)
+	}
+
 	if err != nil {
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			return badRequestError(ErrorCodeValidationFailed, err.Error())
+		}
 		return internalServerError("Error creating user").WithInternalError(err)
+	}
+
+	if params.Id != "" {
+		customId, err := uuid.FromString(params.Id)
+		if err != nil {
+			return badRequestError(ErrorCodeValidationFailed, "ID must conform to the uuid v4 format")
+		}
+		if customId == uuid.Nil {
+			return badRequestError(ErrorCodeValidationFailed, "ID cannot be a nil uuid")
+		}
+		user.ID = customId
 	}
 
 	user.AppMetaData = map[string]interface{}{
@@ -362,6 +410,18 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 		// default to the first provider in the providers slice
 		"provider":  providers[0],
 		"providers": providers,
+	}
+
+	var banDuration *time.Duration
+	if params.BanDuration != "" {
+		duration := time.Duration(0)
+		if params.BanDuration != "none" {
+			duration, err = time.ParseDuration(params.BanDuration)
+			if err != nil {
+				return badRequestError(ErrorCodeValidationFailed, "invalid format for ban duration: %v", err)
+			}
+		}
+		banDuration = &duration
 	}
 
 	err = db.Transaction(func(tx *storage.Connection) error {
@@ -430,15 +490,8 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 
-		if params.BanDuration != "" {
-			duration := time.Duration(0)
-			if params.BanDuration != "none" {
-				duration, err = time.ParseDuration(params.BanDuration)
-				if err != nil {
-					return badRequestError("invalid format for ban duration: %v", err)
-				}
-			}
-			if terr := user.Ban(a.db, duration); terr != nil {
+		if banDuration != nil {
+			if terr := user.Ban(tx, *banDuration); terr != nil {
 				return terr
 			}
 		}
@@ -447,9 +500,6 @@ func (a *API) adminUserCreate(w http.ResponseWriter, r *http.Request) error {
 	})
 
 	if err != nil {
-		if strings.Contains("invalid format for ban duration", err.Error()) {
-			return err
-		}
 		return internalServerError("Database error creating new user").WithInternalError(err)
 	}
 
@@ -462,21 +512,17 @@ func (a *API) adminUserDelete(w http.ResponseWriter, r *http.Request) error {
 	user := getUser(ctx)
 	adminUser := getAdminUser(ctx)
 
-	var err error
+	// ShouldSoftDelete defaults to false
 	params := &adminUserDeleteParams{}
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
-	}
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, params); err != nil {
-			return badRequestError("Could not read params: %v", err)
+	if body, _ := utilities.GetBodyBytes(r); len(body) != 0 {
+		// we only want to parse the body if it's not empty
+		// retrieveRequestParams will handle any errors with stream
+		if err := retrieveRequestParams(r, params); err != nil {
+			return err
 		}
-	} else {
-		params.ShouldSoftDelete = false
 	}
 
-	err = a.db.Transaction(func(tx *storage.Connection) error {
+	err := a.db.Transaction(func(tx *storage.Connection) error {
 		if terr := models.NewAuditLogEntry(r, tx, adminUser, models.UserDeletedAction, "", map[string]interface{}{
 			"user_id":    user.ID,
 			"user_email": user.Email,
@@ -505,10 +551,6 @@ func (a *API) adminUserDelete(w http.ResponseWriter, r *http.Request) error {
 			// hard delete all associated sessions
 			if terr := models.Logout(tx, user.ID); terr != nil {
 				return internalServerError("Error deleting user's sessions").WithInternalError(terr)
-			}
-			// for backward compatibility: hard delete all associated refresh tokens
-			if terr := models.LogoutAllRefreshTokens(tx, user.ID); terr != nil {
-				return internalServerError("Error deleting user's refresh tokens").WithInternalError(terr)
 			}
 		} else {
 			if terr := tx.Destroy(user); terr != nil {
@@ -551,11 +593,7 @@ func (a *API) adminUserDeleteFactor(w http.ResponseWriter, r *http.Request) erro
 func (a *API) adminUserGetFactors(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	user := getUser(ctx)
-	factors, terr := models.FindFactorsByUser(a.db, user)
-	if terr != nil {
-		return terr
-	}
-	return sendJSON(w, http.StatusOK, factors)
+	return sendJSON(w, http.StatusOK, user.Factors)
 }
 
 // adminUserUpdate updates a single factor object
@@ -565,26 +603,24 @@ func (a *API) adminUserUpdateFactor(w http.ResponseWriter, r *http.Request) erro
 	user := getUser(ctx)
 	adminUser := getAdminUser(ctx)
 	params := &adminUserUpdateFactorParams{}
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
+
+	if err := retrieveRequestParams(r, params); err != nil {
+		return err
 	}
 
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read factor update params: %v", err)
-	}
-
-	err = a.db.Transaction(func(tx *storage.Connection) error {
+	err := a.db.Transaction(func(tx *storage.Connection) error {
 		if params.FriendlyName != "" {
 			if terr := factor.UpdateFriendlyName(tx, params.FriendlyName); terr != nil {
 				return terr
 			}
 		}
-		if params.FactorType != "" {
-			if params.FactorType != models.TOTP {
-				return badRequestError("Factor Type not valid")
+
+		if params.Phone != "" && factor.IsPhoneFactor() {
+			phone, err := validatePhone(params.Phone)
+			if err != nil {
+				return badRequestError(ErrorCodeValidationFailed, "Invalid phone number format (E.164 required)")
 			}
-			if terr := factor.UpdateFactorType(tx, params.FactorType); terr != nil {
+			if terr := factor.UpdatePhone(tx, phone); terr != nil {
 				return terr
 			}
 		}

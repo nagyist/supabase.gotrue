@@ -2,7 +2,8 @@ package hooks
 
 import (
 	"github.com/gofrs/uuid"
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 )
 
@@ -22,9 +23,19 @@ const (
 	HookRejection = "reject"
 )
 
+type HTTPHookInput interface {
+	IsHTTPHook()
+}
+
 type HookOutput interface {
 	IsError() bool
 	Error() string
+}
+
+// TODO(joel): Move this to phone package
+type SMS struct {
+	OTP     string `json:"otp,omitempty"`
+	SMSType string `json:"sms_type,omitempty"`
 }
 
 // #nosec
@@ -33,7 +44,7 @@ const MinimumViableTokenSchema = `{
   "type": "object",
   "properties": {
     "aud": {
-      "type": "string"
+      "type": ["string", "array"]
     },
     "exp": {
       "type": "integer"
@@ -83,12 +94,12 @@ const MinimumViableTokenSchema = `{
       "type": "string"
     }
   },
-  "required": ["aud", "exp", "iat", "sub", "email", "phone", "role", "aal", "session_id"]
+  "required": ["aud", "exp", "iat", "sub", "email", "phone", "role", "aal", "session_id", "is_anonymous"]
 }`
 
 // AccessTokenClaims is a struct thats used for JWT claims
 type AccessTokenClaims struct {
-	jwt.StandardClaims
+	jwt.RegisteredClaims
 	Email                         string                 `json:"email"`
 	Phone                         string                 `json:"phone"`
 	AppMetaData                   map[string]interface{} `json:"app_metadata"`
@@ -97,12 +108,14 @@ type AccessTokenClaims struct {
 	AuthenticatorAssuranceLevel   string                 `json:"aal,omitempty"`
 	AuthenticationMethodReference []models.AMREntry      `json:"amr,omitempty"`
 	SessionId                     string                 `json:"session_id,omitempty"`
+	IsAnonymous                   bool                   `json:"is_anonymous"`
 }
 
 type MFAVerificationAttemptInput struct {
-	UserID   uuid.UUID `json:"user_id"`
-	FactorID uuid.UUID `json:"factor_id"`
-	Valid    bool      `json:"valid"`
+	UserID     uuid.UUID `json:"user_id"`
+	FactorID   uuid.UUID `json:"factor_id"`
+	FactorType string    `json:"factor_type"`
+	Valid      bool      `json:"valid"`
 }
 
 type MFAVerificationAttemptOutput struct {
@@ -134,6 +147,24 @@ type CustomAccessTokenOutput struct {
 	HookError AuthHookError          `json:"error,omitempty"`
 }
 
+type SendSMSInput struct {
+	User *models.User `json:"user,omitempty"`
+	SMS  SMS          `json:"sms,omitempty"`
+}
+
+type SendSMSOutput struct {
+	HookError AuthHookError `json:"error,omitempty"`
+}
+
+type SendEmailInput struct {
+	User      *models.User     `json:"user"`
+	EmailData mailer.EmailData `json:"email_data"`
+}
+
+type SendEmailOutput struct {
+	HookError AuthHookError `json:"error,omitempty"`
+}
+
 func (mf *MFAVerificationAttemptOutput) IsError() bool {
 	return mf.HookError.Message != ""
 }
@@ -156,6 +187,22 @@ func (ca *CustomAccessTokenOutput) IsError() bool {
 
 func (ca *CustomAccessTokenOutput) Error() string {
 	return ca.HookError.Message
+}
+
+func (cs *SendSMSOutput) IsError() bool {
+	return cs.HookError.Message != ""
+}
+
+func (cs *SendSMSOutput) Error() string {
+	return cs.HookError.Message
+}
+
+func (cs *SendEmailOutput) IsError() bool {
+	return cs.HookError.Message != ""
+}
+
+func (cs *SendEmailOutput) Error() string {
+	return cs.HookError.Message
 }
 
 type AuthHookError struct {

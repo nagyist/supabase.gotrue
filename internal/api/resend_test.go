@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/conf"
+	mail "github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 )
 
@@ -127,6 +128,8 @@ func (ts *ResendTestSuite) TestResendSuccess() {
 	u.EmailChangeSentAt = &now
 	u.EmailChangeTokenNew = "123456"
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.GetEmail(), u.ConfirmationToken, models.ConfirmationToken))
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.EmailChange, u.EmailChangeTokenNew, models.EmailChangeTokenNew))
 
 	phoneUser, err := models.NewUser("1234567890", "", "password", ts.Config.JWT.Aud, nil)
 	require.NoError(ts.T(), err, "Error creating test user model")
@@ -134,6 +137,7 @@ func (ts *ResendTestSuite) TestResendSuccess() {
 	phoneUser.EmailChangeSentAt = &now
 	phoneUser.EmailChangeTokenNew = "123456"
 	require.NoError(ts.T(), ts.API.db.Create(phoneUser), "Error saving new test user")
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, phoneUser.ID, phoneUser.EmailChange, phoneUser.EmailChangeTokenNew, models.EmailChangeTokenNew))
 
 	emailUser, err := models.NewUser("", "bar@example.com", "password", ts.Config.JWT.Aud, nil)
 	require.NoError(ts.T(), err, "Error creating test user model")
@@ -141,6 +145,7 @@ func (ts *ResendTestSuite) TestResendSuccess() {
 	phoneUser.PhoneChangeSentAt = &now
 	phoneUser.PhoneChangeToken = "123456"
 	require.NoError(ts.T(), ts.API.db.Create(emailUser), "Error saving new test user")
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, phoneUser.ID, phoneUser.PhoneChange, phoneUser.PhoneChangeToken, models.PhoneChangeToken))
 
 	cases := []struct {
 		desc   string
@@ -194,15 +199,15 @@ func (ts *ResendTestSuite) TestResendSuccess() {
 			require.Equal(ts.T(), http.StatusOK, w.Code)
 
 			switch c.params["type"] {
-			case signupVerification, emailChangeVerification:
+			case mail.SignupVerification, mail.EmailChangeVerification:
 				dbUser, err := models.FindUserByID(ts.API.db, c.user.ID)
 				require.NoError(ts.T(), err)
 				require.NotEmpty(ts.T(), dbUser)
 
-				if c.params["type"] == signupVerification {
+				if c.params["type"] == mail.SignupVerification {
 					require.NotEqual(ts.T(), dbUser.ConfirmationToken, c.user.ConfirmationToken)
 					require.NotEqual(ts.T(), dbUser.ConfirmationSentAt, c.user.ConfirmationSentAt)
-				} else if c.params["type"] == emailChangeVerification {
+				} else if c.params["type"] == mail.EmailChangeVerification {
 					require.NotEqual(ts.T(), dbUser.EmailChangeTokenNew, c.user.EmailChangeTokenNew)
 					require.NotEqual(ts.T(), dbUser.EmailChangeSentAt, c.user.EmailChangeSentAt)
 				}

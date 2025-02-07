@@ -89,13 +89,13 @@ func (ts *TokenTestSuite) TestSessionTimebox() {
 	assert.Equal(ts.T(), http.StatusBadRequest, w.Code)
 
 	var firstResult struct {
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		ErrorCode string `json:"error_code"`
+		Message   string `json:"msg"`
 	}
 
 	assert.NoError(ts.T(), json.NewDecoder(w.Result().Body).Decode(&firstResult))
-	assert.Equal(ts.T(), "invalid_grant", firstResult.Error)
-	assert.Equal(ts.T(), "Invalid Refresh Token: Session Expired", firstResult.ErrorDescription)
+	assert.Equal(ts.T(), ErrorCodeSessionExpired, firstResult.ErrorCode)
+	assert.Equal(ts.T(), "Invalid Refresh Token: Session Expired", firstResult.Message)
 }
 
 func (ts *TokenTestSuite) TestSessionInactivityTimeout() {
@@ -124,13 +124,13 @@ func (ts *TokenTestSuite) TestSessionInactivityTimeout() {
 	assert.Equal(ts.T(), http.StatusBadRequest, w.Code)
 
 	var firstResult struct {
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		ErrorCode string `json:"error_code"`
+		Message   string `json:"msg"`
 	}
 
 	assert.NoError(ts.T(), json.NewDecoder(w.Result().Body).Decode(&firstResult))
-	assert.Equal(ts.T(), "invalid_grant", firstResult.Error)
-	assert.Equal(ts.T(), "Invalid Refresh Token: Session Expired (Inactivity)", firstResult.ErrorDescription)
+	assert.Equal(ts.T(), ErrorCodeSessionExpired, firstResult.ErrorCode)
+	assert.Equal(ts.T(), "Invalid Refresh Token: Session Expired (Inactivity)", firstResult.Message)
 }
 
 func (ts *TokenTestSuite) TestFailedToSaveRefreshTokenResultCase() {
@@ -213,13 +213,13 @@ func (ts *TokenTestSuite) TestSingleSessionPerUserNoTags() {
 	assert.True(ts.T(), ts.API.config.Sessions.SinglePerUser)
 
 	var firstResult struct {
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		ErrorCode string `json:"error_code"`
+		Message   string `json:"msg"`
 	}
 
 	assert.NoError(ts.T(), json.NewDecoder(w.Result().Body).Decode(&firstResult))
-	assert.Equal(ts.T(), "invalid_grant", firstResult.Error)
-	assert.Equal(ts.T(), "Invalid Refresh Token: Session Expired (Revoked by Newer Login)", firstResult.ErrorDescription)
+	assert.Equal(ts.T(), ErrorCodeSessionExpired, firstResult.ErrorCode)
+	assert.Equal(ts.T(), "Invalid Refresh Token: Session Expired (Revoked by Newer Login)", firstResult.Message)
 }
 
 func (ts *TokenTestSuite) TestRateLimitTokenRefresh() {
@@ -306,8 +306,7 @@ func (ts *TokenTestSuite) TestTokenPKCEGrantFailure() {
 	invalidVerifier := codeVerifier + "123"
 	codeChallenge := sha256.Sum256([]byte(codeVerifier))
 	challenge := base64.RawURLEncoding.EncodeToString(codeChallenge[:])
-	flowState, err := models.NewFlowState("github", challenge, models.SHA256, models.OAuth)
-	require.NoError(ts.T(), err)
+	flowState := models.NewFlowState("github", challenge, models.SHA256, models.OAuth, nil)
 	flowState.AuthCode = authCode
 	require.NoError(ts.T(), ts.API.db.Create(flowState))
 	cases := []struct {
@@ -344,7 +343,7 @@ func (ts *TokenTestSuite) TestTokenPKCEGrantFailure() {
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 			ts.API.handler.ServeHTTP(w, req)
-			assert.Equal(ts.T(), http.StatusForbidden, w.Code)
+			assert.Equal(ts.T(), http.StatusNotFound, w.Code)
 		})
 	}
 }
@@ -429,13 +428,13 @@ func (ts *TokenTestSuite) TestRefreshTokenReuseRevocation() {
 	assert.Equal(ts.T(), http.StatusBadRequest, w.Code)
 
 	var response struct {
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		ErrorCode string `json:"error_code"`
+		Message   string `json:"msg"`
 	}
 
 	require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&response))
-	require.Equal(ts.T(), response.Error, "invalid_grant")
-	require.Equal(ts.T(), response.ErrorDescription, "Invalid Refresh Token: Already Used")
+	require.Equal(ts.T(), ErrorCodeRefreshTokenAlreadyUsed, response.ErrorCode)
+	require.Equal(ts.T(), "Invalid Refresh Token: Already Used", response.Message)
 
 	// ensure that the refresh tokens are marked as revoked in the database
 	for _, refreshToken := range refreshTokens {
@@ -462,13 +461,13 @@ func (ts *TokenTestSuite) TestRefreshTokenReuseRevocation() {
 		assert.Equal(ts.T(), http.StatusBadRequest, w.Code, "For refresh token %d", i)
 
 		var response struct {
-			Error            string `json:"error"`
-			ErrorDescription string `json:"error_description"`
+			ErrorCode string `json:"error_code"`
+			Message   string `json:"msg"`
 		}
 
 		require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&response))
-		require.Equal(ts.T(), response.Error, "invalid_grant", "For refresh token %d", i)
-		require.Equal(ts.T(), response.ErrorDescription, "Invalid Refresh Token: Already Used", "For refresh token %d", i)
+		require.Equal(ts.T(), ErrorCodeRefreshTokenAlreadyUsed, response.ErrorCode, "For refresh token %d", i)
+		require.Equal(ts.T(), "Invalid Refresh Token: Already Used", response.Message, "For refresh token %d", i)
 	}
 }
 
@@ -605,9 +604,9 @@ func (ts *TokenTestSuite) TestPasswordVerificationHook() {
 			uri:  "pg-functions://postgres/auth/password_verification_hook",
 			hookFunctionSQL: `
                 create or replace function password_verification_hook(input jsonb)
-                returns json as $$
+                returns jsonb as $$
                 begin
-                    return json_build_object('decision', 'continue');
+                    return jsonb_build_object('decision', 'continue');
                 end; $$ language plpgsql;`,
 			expectedCode: http.StatusOK,
 		}, {
@@ -615,11 +614,11 @@ func (ts *TokenTestSuite) TestPasswordVerificationHook() {
 			uri:  "pg-functions://postgres/auth/password_verification_hook_reject",
 			hookFunctionSQL: `
                 create or replace function password_verification_hook_reject(input jsonb)
-                returns json as $$
+                returns jsonb as $$
                 begin
-                    return json_build_object('decision', 'reject');
+                    return jsonb_build_object('decision', 'reject', 'message', 'You shall not pass!');
                 end; $$ language plpgsql;`,
-			expectedCode: http.StatusForbidden,
+			expectedCode: http.StatusBadRequest,
 		},
 	}
 	for _, c := range cases {

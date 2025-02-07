@@ -12,8 +12,13 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      MAIN_RELEASE_VERSION: ${{ steps.versions.outputs.MAIN_RELEASE_VERSION }}
+      RELEASE_VERSION: ${{ steps.versions.outputs.RELEASE_VERSION }}
+      RELEASE_CANDIDATE: ${{ steps.versions.outputs.RELEASE_CANDIDATE }}
+      RELEASE_NAME: ${{ steps.versions.outputs.RELEASE_NAME }}
     steps:
-      - uses: google-github-actions/release-please-action@v4
+      - uses: googleapis/release-please-action@v4
         id: release
         with:
           release-type: go
@@ -24,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - if: ${{ steps.release.outputs }}
+      - if: ${{ steps.release.outputs.release_created == 'true' || steps.release.outputs.prs_created == 'true' }}
         id: versions
         run: |
           set -ex
@@ -48,7 +53,7 @@ jobs:
             # Use git describe tags to identify the number of commits the branch
             # is ahead of the most recent non-release-candidate tag, which is
             # part of the rc.<commits> value.
-            RELEASE_VERSION=$MAIN_RELEASE_VERSION-rc.$(node -e "console.log('$(git describe --tags --exclude *rc*)'.split('-')[1])")
+            RELEASE_VERSION=$MAIN_RELEASE_VERSION-rc.$(node -e "console.log('$(git describe --tags --exclude rc*)'.split('-')[1])")
 
             # release-please only ignores releases that have a form like [A-Z0-9]<version>, so prefixing with rc<version>
             RELEASE_NAME="rc$RELEASE_VERSION"
@@ -68,10 +73,10 @@ jobs:
           echo "RELEASE_CANDIDATE=${RELEASE_CANDIDATE}" >> "${GITHUB_OUTPUT}"
           echo "RELEASE_NAME=${RELEASE_NAME}" >> "${GITHUB_OUTPUT}"
 
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         if: ${{ steps.release.outputs.release_created == 'true' || steps.release.outputs.prs_created == 'true' }}
         with:
-          go-version: "^1.21.0" # The Go version to download (if necessary) and use.
+          go-version: "^1.22.0" # The Go version to download (if necessary) and use.
 
       - name: Build release artifacts
         if: ${{ steps.release.outputs.release_created == 'true' || steps.release.outputs.prs_created == 'true' }}
@@ -128,8 +133,8 @@ jobs:
   publish:
     needs:
       - release_please
-    if: ${{ success() && needs.release_please.outputs.RELEASE_NAME }}
+    if: ${{ success() && needs.release_please.outputs.RELEASE_VERSION }}
     uses: ./.github/workflows/publish.yml
     secrets: inherit
     with:
-      version: ${{ needs.release_please.outputs.RELEASE_NAME }}
+      version: ${{ needs.release_please.outputs.RELEASE_VERSION }}

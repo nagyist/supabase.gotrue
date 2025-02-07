@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/gobwas/glob"
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/conf"
@@ -48,6 +48,49 @@ func (ts *MailTestSuite) SetupTest() {
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new user")
 }
 
+func (ts *MailTestSuite) TestValidateEmail() {
+	cases := []struct {
+		desc          string
+		email         string
+		expectedEmail string
+		expectedError error
+	}{
+		{
+			desc:          "valid email",
+			email:         "test@example.com",
+			expectedEmail: "test@example.com",
+			expectedError: nil,
+		},
+		{
+			desc:          "email should be normalized",
+			email:         "TEST@EXAMPLE.COM",
+			expectedEmail: "test@example.com",
+			expectedError: nil,
+		},
+		{
+			desc:          "empty email should return error",
+			email:         "",
+			expectedEmail: "",
+			expectedError: badRequestError(ErrorCodeValidationFailed, "An email address is required"),
+		},
+		{
+			desc: "email length exceeds 255 characters",
+			// email has 256 characters
+			email:         "testtesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttesttest@example.com",
+			expectedEmail: "",
+			expectedError: badRequestError(ErrorCodeValidationFailed, "An email address is too long"),
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			email, err := ts.API.validateEmail(c.email)
+			require.Equal(ts.T(), c.expectedError, err)
+			require.Equal(ts.T(), c.expectedEmail, email)
+		})
+	}
+}
+
 func (ts *MailTestSuite) TestGenerateLink() {
 	// create admin jwt
 	claims := &AccessTokenClaims{
@@ -65,7 +108,19 @@ func (ts *MailTestSuite) TestGenerateLink() {
 		ExpectedResponse map[string]interface{}
 	}{
 		{
-			Desc: "Generate signup link",
+			Desc: "Generate signup link for new user",
+			Body: GenerateLinkParams{
+				Email:    "new_user@example.com",
+				Password: "secret123",
+				Type:     "signup",
+			},
+			ExpectedCode: http.StatusOK,
+			ExpectedResponse: map[string]interface{}{
+				"redirect_to": ts.Config.SiteURL,
+			},
+		},
+		{
+			Desc: "Generate signup link for existing user",
 			Body: GenerateLinkParams{
 				Email:    "test@example.com",
 				Password: "secret123",
@@ -151,6 +206,11 @@ func (ts *MailTestSuite) TestGenerateLink() {
 	customDomainUrl, err := url.ParseRequestURI("https://example.gotrue.com")
 	require.NoError(ts.T(), err)
 
+	originalHosts := ts.API.config.Mailer.ExternalHosts
+	ts.API.config.Mailer.ExternalHosts = []string{
+		"example.gotrue.com",
+	}
+
 	for _, c := range cases {
 		ts.Run(c.Desc, func() {
 			var buffer bytes.Buffer
@@ -184,6 +244,8 @@ func (ts *MailTestSuite) TestGenerateLink() {
 			require.Equal(ts.T(), req.Host, u.Host)
 		})
 	}
+
+	ts.API.config.Mailer.ExternalHosts = originalHosts
 }
 
 func (ts *MailTestSuite) setURIAllowListMap(uris ...string) {

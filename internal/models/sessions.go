@@ -103,6 +103,10 @@ func (s *Session) LastRefreshedAt(refreshTokenTime *time.Time) time.Time {
 }
 
 func (s *Session) UpdateOnlyRefreshInfo(tx *storage.Connection) error {
+	// TODO(kangmingtay): The underlying database type uses timestamp without timezone,
+	// so we need to convert the value to UTC before updating it.
+	// In the future, we should add a migration to update the type to contain the timezone.
+	*s.RefreshedAt = s.RefreshedAt.UTC()
 	return tx.UpdateOnly(s, "refreshed_at", "user_agent", "ip")
 }
 
@@ -154,14 +158,16 @@ func (s *Session) DetermineTag(tags []string) string {
 	return tags[0]
 }
 
-func NewSession() (*Session, error) {
+func NewSession(userID uuid.UUID, factorID *uuid.UUID) (*Session, error) {
 	id := uuid.Must(uuid.NewV4())
 
 	defaultAAL := AAL1.String()
 
 	session := &Session{
-		ID:  id,
-		AAL: &defaultAAL,
+		ID:       id,
+		AAL:      &defaultAAL,
+		UserID:   userID,
+		FactorID: factorID,
 	}
 
 	return session, nil
@@ -270,21 +276,18 @@ func LogoutAllExceptMe(tx *storage.Connection, sessionId uuid.UUID, userID uuid.
 	return tx.RawQuery("DELETE FROM "+(&pop.Model{Value: Session{}}).TableName()+" WHERE id != ? AND user_id = ?", sessionId, userID).Exec()
 }
 
-func (s *Session) UpdateAssociatedFactor(tx *storage.Connection, factorID *uuid.UUID) error {
+func (s *Session) UpdateAALAndAssociatedFactor(tx *storage.Connection, aal AuthenticatorAssuranceLevel, factorID *uuid.UUID) error {
 	s.FactorID = factorID
-	return tx.Update(s)
+	aalAsString := aal.String()
+	s.AAL = &aalAsString
+	return tx.UpdateOnly(s, "aal", "factor_id")
 }
 
-func (s *Session) UpdateAssociatedAAL(tx *storage.Connection, aal string) error {
-	s.AAL = &aal
-	return tx.Update(s)
-}
-
-func (s *Session) CalculateAALAndAMR(tx *storage.Connection) (aal string, amr []AMREntry, err error) {
-	amr, aal = []AMREntry{}, AAL1.String()
+func (s *Session) CalculateAALAndAMR(user *User) (aal AuthenticatorAssuranceLevel, amr []AMREntry, err error) {
+	amr, aal = []AMREntry{}, AAL1
 	for _, claim := range s.AMRClaims {
-		if *claim.AuthenticationMethod == TOTPSignIn.String() {
-			aal = AAL2.String()
+		if claim.IsAAL2Claim() {
+			aal = AAL2
 		}
 		amr = append(amr, AMREntry{Method: claim.GetAuthenticationMethod(), Timestamp: claim.UpdatedAt.Unix()})
 	}
@@ -306,15 +309,12 @@ func (s *Session) CalculateAALAndAMR(tx *storage.Connection) (aal string, amr []
 	if lastIndex > -1 && amr[lastIndex].Method == SSOSAML.String() {
 		// initial AMR claim is from sso/saml, we need to add information
 		// about the provider that was used for the authentication
-		identities, err := FindIdentitiesByUserID(tx, s.UserID)
-		if err != nil {
-			return aal, amr, err
-		}
+		identities := user.Identities
 
 		if len(identities) == 1 {
 			identity := identities[0]
 
-			if strings.HasPrefix(identity.Provider, "sso:") {
+			if identity.IsForSSOProvider() {
 				amr[lastIndex].Provider = strings.TrimPrefix(identity.Provider, "sso:")
 			}
 		}

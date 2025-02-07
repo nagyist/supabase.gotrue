@@ -2,18 +2,14 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"net/http"
 	"time"
 
-	"github.com/fatih/structs"
 	"github.com/gofrs/uuid"
-	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/api/sms_provider"
+	"github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
-	"github.com/supabase/auth/internal/utilities"
 )
 
 // UserUpdateParams parameters for updating a user
@@ -34,7 +30,7 @@ func (a *API) validateUserUpdateParams(ctx context.Context, p *UserUpdateParams)
 
 	var err error
 	if p.Email != "" {
-		p.Email, err = validateEmail(p.Email)
+		p.Email, err = a.validateEmail(p.Email)
 		if err != nil {
 			return err
 		}
@@ -47,8 +43,8 @@ func (a *API) validateUserUpdateParams(ctx context.Context, p *UserUpdateParams)
 		if p.Channel == "" {
 			p.Channel = sms_provider.SMSProvider
 		}
-		if !sms_provider.IsValidMessageChannel(p.Channel, config.Sms.Provider) {
-			return badRequestError(InvalidChannelError)
+		if !sms_provider.IsValidMessageChannel(p.Channel, config) {
+			return badRequestError(ErrorCodeValidationFailed, InvalidChannelError)
 		}
 	}
 
@@ -66,12 +62,13 @@ func (a *API) UserGet(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	claims := getClaims(ctx)
 	if claims == nil {
-		return badRequestError("Could not read claims")
+		return internalServerError("Could not read claims")
 	}
 
 	aud := a.requestAud(ctx, r)
-	if aud != claims.Audience {
-		return badRequestError("Token audience doesn't match request audience")
+	audienceFromClaims, _ := claims.GetAudience()
+	if len(audienceFromClaims) == 0 || aud != audienceFromClaims[0] {
+		return badRequestError(ErrorCodeValidationFailed, "Token audience doesn't match request audience")
 	}
 
 	user := getUser(ctx)
@@ -86,14 +83,8 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 	aud := a.requestAud(ctx, r)
 
 	params := &UserUpdateParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
-	}
-
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read User Update params: %v", err)
+	if err := retrieveRequestParams(r, params); err != nil {
+		return err
 	}
 
 	user := getUser(ctx)
@@ -105,7 +96,21 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 
 	if params.AppData != nil && !isAdmin(user, config) {
 		if !isAdmin(user, config) {
-			return unauthorizedError("Updating app_metadata requires admin privileges")
+			return forbiddenError(ErrorCodeNotAdmin, "Updating app_metadata requires admin privileges")
+		}
+	}
+
+	if user.HasMFAEnabled() && !session.IsAAL2() {
+		if (params.Password != nil && *params.Password != "") || (params.Email != "" && user.GetEmail() != params.Email) || (params.Phone != "" && user.GetPhone() != params.Phone) {
+			return httpError(http.StatusUnauthorized, ErrorCodeInsufficientAAL, "AAL2 session is required to update email or password when MFA is enabled.")
+		}
+	}
+
+	if user.IsAnonymous {
+		if params.Password != nil && *params.Password != "" {
+			if params.Email == "" && params.Phone == "" {
+				return unprocessableEntityError(ErrorCodeValidationFailed, "Updating password of an anonymous user without an email or phone is not allowed")
+			}
 		}
 	}
 
@@ -118,7 +123,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 		updatingForbiddenFields = updatingForbiddenFields || (params.Nonce != "")
 
 		if updatingForbiddenFields {
-			return unprocessableEntityError("Updating email, phone, password of a SSO account only possible via SSO")
+			return unprocessableEntityError(ErrorCodeUserSSOManaged, "Updating email, phone, password of a SSO account only possible via SSO")
 		}
 	}
 
@@ -126,7 +131,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 		if duplicateUser, err := models.IsDuplicatedEmail(db, params.Email, aud, user); err != nil {
 			return internalServerError("Database error checking email").WithInternalError(err)
 		} else if duplicateUser != nil {
-			return unprocessableEntityError(DuplicateEmailMsg)
+			return unprocessableEntityError(ErrorCodeEmailExists, DuplicateEmailMsg)
 		}
 	}
 
@@ -134,7 +139,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 		if exists, err := models.IsDuplicatedPhone(db, params.Phone, aud); err != nil {
 			return internalServerError("Database error checking phone").WithInternalError(err)
 		} else if exists {
-			return unprocessableEntityError(DuplicatePhoneMsg)
+			return unprocessableEntityError(ErrorCodePhoneExists, DuplicatePhoneMsg)
 		}
 	}
 
@@ -144,7 +149,7 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			// we require reauthentication if the user hasn't signed in recently in the current session
 			if session == nil || now.After(session.CreatedAt.Add(24*time.Hour)) {
 				if len(params.Nonce) == 0 {
-					return badRequestError("Password update requires reauthentication")
+					return badRequestError(ErrorCodeReauthenticationNeeded, "Password update requires reauthentication")
 				}
 				if err := a.verifyReauthentication(params.Nonce, db, config, user); err != nil {
 					return err
@@ -154,17 +159,28 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 
 		password := *params.Password
 		if password != "" {
-			if user.EncryptedPassword != "" && user.Authenticate(ctx, password) {
-				return unprocessableEntityError("New password should be different from the old password.")
+			isSamePassword := false
+
+			if user.HasPassword() {
+				auth, _, err := user.Authenticate(ctx, db, password, config.Security.DBEncryption.DecryptionKeys, false, "")
+				if err != nil {
+					return err
+				}
+
+				isSamePassword = auth
+			}
+
+			if isSamePassword {
+				return unprocessableEntityError(ErrorCodeSamePassword, "New password should be different from the old password.")
 			}
 		}
 
-		if err := user.SetPassword(ctx, password); err != nil {
+		if err := user.SetPassword(ctx, password, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
 			return err
 		}
 	}
 
-	err = db.Transaction(func(tx *storage.Connection) error {
+	err := db.Transaction(func(tx *storage.Connection) error {
 		var terr error
 		if params.Password != nil {
 			var sessionID *uuid.UUID
@@ -193,85 +209,48 @@ func (a *API) UserUpdate(w http.ResponseWriter, r *http.Request) error {
 			}
 		}
 
-		var identities []models.Identity
 		if params.Email != "" && params.Email != user.GetEmail() {
-			identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), "email")
-			if terr != nil {
-				if !models.IsNotFoundError(terr) {
+			if user.IsAnonymous && config.Mailer.Autoconfirm {
+				// anonymous users can add an email with automatic confirmation, which is similar to signing up
+				// permanent users always need to verify their email address when changing it
+				user.EmailChange = params.Email
+				if _, terr := a.emailChangeVerify(r, tx, &VerifyParams{
+					Type:  mailer.EmailChangeVerification,
+					Email: params.Email,
+				}, user); terr != nil {
 					return terr
 				}
-				// updating the user's email should create a new email identity since the user doesn't have one
-				identity, terr = a.createNewIdentity(tx, user, "email", structs.Map(provider.Claims{
-					Subject: user.ID.String(),
-					Email:   params.Email,
-				}))
-				if terr != nil {
-					return terr
-				}
+
 			} else {
-				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
-					"email": params.Email,
-				}); terr != nil {
+				flowType := getFlowFromChallenge(params.CodeChallenge)
+				if isPKCEFlow(flowType) {
+					_, terr := generateFlowState(tx, models.EmailChange.String(), models.EmailChange, params.CodeChallengeMethod, params.CodeChallenge, &user.ID)
+					if terr != nil {
+						return terr
+					}
+
+				}
+				if terr = a.sendEmailChange(r, tx, user, params.Email, flowType); terr != nil {
 					return terr
 				}
-			}
-			identities = append(identities, *identity)
-			mailer := a.Mailer(ctx)
-			referrer := utilities.GetReferrer(r, config)
-			flowType := getFlowFromChallenge(params.CodeChallenge)
-			if isPKCEFlow(flowType) {
-				codeChallengeMethod, terr := models.ParseCodeChallengeMethod(params.CodeChallengeMethod)
-				if terr != nil {
-					return terr
-				}
-				if terr := models.NewFlowStateWithUserID(tx, models.EmailChange.String(), params.CodeChallenge, codeChallengeMethod, models.EmailChange, &user.ID); terr != nil {
-					return terr
-				}
-			}
-			externalURL := getExternalHost(ctx)
-			if terr = a.sendEmailChange(tx, config, user, mailer, params.Email, referrer, externalURL, config.Mailer.OtpLength, flowType); terr != nil {
-				if errors.Is(terr, MaxFrequencyLimitError) {
-					return tooManyRequestsError("For security purposes, you can only request this once every 60 seconds")
-				}
-				return internalServerError("Error sending change email").WithInternalError(terr)
 			}
 		}
 
 		if params.Phone != "" && params.Phone != user.GetPhone() {
-			identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), "phone")
-			if terr != nil {
-				if !models.IsNotFoundError(terr) {
-					return terr
-				}
-				// updating the user's phone should create a new phone identity since the user doesn't have one
-				identity, terr = a.createNewIdentity(tx, user, "phone", structs.Map(provider.Claims{
-					Subject: user.ID.String(),
-					Phone:   params.Phone,
-				}))
-				if terr != nil {
-					return terr
-				}
-			} else {
-				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
-					"phone": params.Phone,
+			if config.Sms.Autoconfirm {
+				user.PhoneChange = params.Phone
+				if _, terr := a.smsVerify(r, tx, user, &VerifyParams{
+					Type:  phoneChangeVerification,
+					Phone: params.Phone,
 				}); terr != nil {
 					return terr
 				}
-			}
-			identities = append(identities, *identity)
-			if config.Sms.Autoconfirm {
-				return user.UpdatePhone(tx, params.Phone)
 			} else {
-				smsProvider, terr := sms_provider.GetSmsProvider(*config)
-				if terr != nil {
-					return badRequestError("Error sending sms: %v", terr)
-				}
-				if _, terr := a.sendPhoneConfirmation(ctx, tx, user, params.Phone, phoneChangeVerification, smsProvider, params.Channel); terr != nil {
-					return internalServerError("Error sending phone change otp").WithInternalError(terr)
+				if _, terr := a.sendPhoneConfirmation(r, tx, user, params.Phone, phoneChangeVerification, params.Channel); terr != nil {
+					return terr
 				}
 			}
 		}
-		user.Identities = append(user.Identities, identities...)
 
 		if terr = models.NewAuditLogEntry(r, tx, user, models.UserModifiedAction, "", nil); terr != nil {
 			return internalServerError("Error recording audit log entry").WithInternalError(terr)
